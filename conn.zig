@@ -15,17 +15,26 @@ pub fn main() !void {
 
     print("got bytes: {d}\n", .{bytes});
     print("data: {s}\n", .{buf[0..bytes]});
+
+    while (true) {
+        bytes = try rdr.read(&buf);
+        print("got bytes: {d}\n", .{bytes});
+        print("data: {s}\n", .{buf[0..bytes]});
+        if (bytes == 0) {
+            break;
+        }
+    }
 }
 
 const Parser = struct {
     state: ParserState,
-    command: Command,
+    op: OpName,
     msg: []const u8,
 
     fn init() Parser {
         return Parser{
             .state = .start,
-            .command = .unknown,
+            .op = undefined,
             .msg = undefined,
         };
     }
@@ -64,22 +73,130 @@ const Parser = struct {
                     }
                 },
                 .info_ => {
-                    self.command = .info;
+                    self.op = .info;
                     self.msg = buf[i..];
                     return;
                 },
+                .info_args => {},
             }
         }
     }
 };
 
-const Command = enum {
-    unknown,
+pub fn buildParser(comptime callback: fn (op: Op) void) BuildParser(callback) {
+    return .{ .state = .start };
+}
+
+pub fn BuildParser(
+    //comptime readFn: fn (buffer: []u8) std.io.FixedBufferStream.ReadError!usize,
+    comptime callback: fn (op: Op) void,
+) type {
+    return struct {
+        const Self = @This();
+        state: ParserState,
+
+        fn init() Self {
+            return Self{
+                .state = .start,
+            };
+        }
+
+        // fn loop(self: *Self) void {
+        //     var stratch: [16]u8 = undefined;
+        //     while (true) {
+        //         //var tmp = stratch[0..];
+        //         var bytes_read = try readFn(stratch[0..]);
+        //         if (bytes_read == 0) {
+        //             break;
+        //         }
+        //         var bytes = stratch[0..bytes_read];
+        //         try self.parse(bytes);
+        //         print("bytes read: {d} {d}\n", .{ bytes_read, bytes.len });
+        //     }
+        // }
+
+        fn parse(self: *Self, buf: []const u8) ParserError!void {
+            var args_start: usize = 0;
+            var drop: usize = 0;
+            for (buf) |b, i| {
+                switch (self.state) {
+                    .start => {
+                        args_start = 0;
+                        drop = 0;
+
+                        switch (b) {
+                            'I', 'i' => self.state = .i,
+                            else => return ParserError.UnexpectedToken,
+                        }
+                    },
+                    .i => {
+                        switch (b) {
+                            'N', 'n' => self.state = .in,
+                            else => return ParserError.UnexpectedToken,
+                        }
+                    },
+                    .in => {
+                        switch (b) {
+                            'F', 'f' => self.state = .inf,
+                            else => return ParserError.UnexpectedToken,
+                        }
+                    },
+                    .inf => {
+                        switch (b) {
+                            'O', 'o' => self.state = .info,
+                            else => return ParserError.UnexpectedToken,
+                        }
+                    },
+                    .info => {
+                        switch (b) {
+                            ' ', '\t' => {},
+                            else => {
+                                self.state = .info_args;
+                                args_start = i;
+                            },
+                        }
+                    },
+                    .info_args => {
+                        switch (b) {
+                            '\r' => {
+                                drop = 1;
+                            },
+                            '\n' => {
+                                var op = Op{
+                                    .name = .info,
+                                    .args = buf[args_start .. i - drop],
+                                };
+                                callback(op);
+                                self.state = .start;
+                            },
+                            else => {},
+                        }
+                    },
+                    .info_ => {}, // TODO remove
+                }
+            }
+        }
+    };
+}
+
+const Op = struct {
+    name: OpName,
+    args: []const u8,
+    payload: []u8 = undefined,
+};
+
+const OpName = enum {
     info,
+    connect,
+    pub_op, // pub is reserved word
+    sub,
+    unsub,
+    msg,
     ping,
     pong,
-    msg,
     hmsg,
+    ok,
+    err,
 };
 
 const ParserError = error{
@@ -93,14 +210,8 @@ const ParserState = enum {
     inf,
     info,
     info_,
+    info_args,
 };
-
-const Tokens = enum(u8) {
-    start,
-    i = 'I',
-    _,
-};
-
 
 // TODO check this empty string idea, trying to avoid undefined
 const empty_str = ([_]u8{})[0..];
@@ -154,43 +265,35 @@ const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const mem = std.mem;
 
-
 test "parser info message" {
     const buf =
         \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":1048576,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1"}
     ;
 
-    // print("len: {d}\n", .{buf.len});
-    // try expect(buf.len == 208);
-    // var p = Parser.init();
-    // try p.parse(buf[0..]);
-    // try expect(p.command == .info);
-    // try expect(p.msg.len == 203);
-
     const Case = struct {
         buf: []const u8,
-        command: Command,
+        op: OpName,
         args_buf_len: u32,
     };
     const valid = [_]Case{
         Case{
             .buf = "INFO 0123456789",
-            .command = .info,
+            .op = .info,
             .args_buf_len = 10,
         },
         Case{
             .buf = "info 0123456789",
-            .command = .info,
+            .op = .info,
             .args_buf_len = 10,
         },
         Case{
             .buf = "iNfO 0123456789",
-            .command = .info,
+            .op = .info,
             .args_buf_len = 10,
         },
         Case{
             .buf = buf,
-            .command = .info,
+            .op = .info,
             .args_buf_len = 203,
         },
     };
@@ -198,7 +301,7 @@ test "parser info message" {
     for (valid) |r| {
         var p = Parser.init();
         try p.parse(r.buf);
-        try expect(p.command == r.command);
+        try expect(p.op == r.op);
         try expect(p.msg.len == r.args_buf_len);
     }
 
@@ -221,7 +324,7 @@ test "parser info message" {
 
 test "decode server info message body" {
     const buf =
-        \\{"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1"}
+        \\{"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
     ;
 
     var alloc = std.testing.allocator;
@@ -239,4 +342,212 @@ test "decode server info message body" {
     try expectEqual(im.client_id, 53);
     try expect(im.headers);
     try expect(im.jetstream);
+
+    try expectEqual(im.connect_urls.len, 3);
+    try expect(mem.eql(u8, im.connect_urls[0], "10.0.0.184:4333"));
+    try expect(mem.eql(u8, im.connect_urls[1], "192.168.129.1:4333"));
+    try expect(mem.eql(u8, im.connect_urls[2], "192.168.192.1:4333"));
+}
+
+fn printOp(op: Op) void {
+    print("op: {}\nargs: {s}\n", .{ op.name, op.args });
+}
+
+test "build parser" {
+    const buf =
+        \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
+        \\INFO foo
+        \\INFO foo bar
+        \\
+    ;
+
+    const c = struct {
+        var ops = std.ArrayList(Op).init(std.testing.allocator);
+        const Self = @This();
+
+        fn printOp(op: Op) void {
+            ops.append(op) catch {};
+            //print("op: {}\nargs: {s}\n", .{ op.name, op.args });
+        }
+    };
+    defer c.ops.deinit();
+
+    var p = buildParser(c.printOp);
+    //var p = BuildParser(c.printOp).init();
+    try p.parse(buf);
+
+    try expectEqual(c.ops.items.len, 3);
+    try expectEqual(c.ops.items[0].name, .info);
+    try expectEqual(c.ops.items[0].args[0], '{');
+    try expectEqual(c.ops.items[0].args[278], '}');
+    try expectEqual(c.ops.items[0].args.len, 279);
+
+    try expectEqual(c.ops.items[1].name, .info);
+    try expect(mem.eql(u8, c.ops.items[1].args, "foo"));
+
+    try expectEqual(c.ops.items[2].name, .info);
+    try expect(mem.eql(u8, c.ops.items[2].args, "foo bar"));
+}
+
+test "fixed buffer" {
+    const buf =
+        \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
+        \\INFO foo
+        \\INFO foo bar
+        \\
+    ;
+
+    var stream = std.io.fixedBufferStream(buf);
+    var stratch: [16]u8 = undefined;
+    while (true) {
+        //var tmp = stratch[0..];
+        var bytes_read = try stream.read(stratch[0..]);
+        if (bytes_read == 0) {
+            break;
+        }
+        var bytes = stratch[0..bytes_read];
+        print("bytes read: {d} {d}\n", .{ bytes_read, bytes.len });
+    }
+}
+
+test "build parser 2" {
+    const buf =
+        \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
+        \\INFO foo
+        \\INFO foo bar
+        \\
+    ;
+
+    var c = OperationsCollector.init(std.testing.allocator);
+    defer c.deinit();
+
+    var stream = std.io.fixedBufferStream(buf);
+    var br = bufferedReader(stream, &c);
+    try br.loop();
+}
+
+const OperationsCollector = struct {
+    ops: std.ArrayList(Op),
+    const Self = @This();
+
+    fn init(alloc: Allocator) Self {
+        return Self{
+            .ops = std.ArrayList(Op).init(alloc),
+        };
+    }
+
+    fn on_op(self: *Self, op: Op) void {
+        self.ops.append(op) catch {};
+        print("op: {}\nargs: {s}\n", .{ op.name, op.args });
+    }
+
+    fn deinit(self: *Self) void {
+        self.ops.deinit();
+    }
+};
+
+// reads operations from the underlying reader
+// calls op handler for each parsed operation
+pub fn OpReader(
+    comptime buffer_size: usize,
+    comptime ReaderType: type,
+    comptime OpHandlerType: type,
+) type {
+    return struct {
+        parent: ReaderType,
+        handler: OpHandlerType,
+        state: ParserState = .start,
+
+        const Error = ReaderType.ReadError || ParserError;
+        const Self = @This();
+
+        pub fn loop(self: *Self) Error!void {
+            var scratch: [buffer_size]u8 = undefined;
+
+            while (true) {
+                var bytes_read = try self.parent.read(scratch[0..]);
+                if (bytes_read == 0) {
+                    return;
+                }
+                try self.parse(scratch[0..bytes_read]);
+            }
+        }
+
+        fn parse(self: *Self, buf: []const u8) ParserError!void {
+            var args_start: usize = 0;
+            var drop: usize = 0;
+            for (buf) |b, i| {
+                switch (self.state) {
+                    .start => {
+                        args_start = 0;
+                        drop = 0;
+
+                        switch (b) {
+                            'I', 'i' => self.state = .i,
+                            else => return ParserError.UnexpectedToken,
+                        }
+                    },
+                    .i => {
+                        switch (b) {
+                            'N', 'n' => self.state = .in,
+                            else => return ParserError.UnexpectedToken,
+                        }
+                    },
+                    .in => {
+                        switch (b) {
+                            'F', 'f' => self.state = .inf,
+                            else => return ParserError.UnexpectedToken,
+                        }
+                    },
+                    .inf => {
+                        switch (b) {
+                            'O', 'o' => self.state = .info,
+                            else => return ParserError.UnexpectedToken,
+                        }
+                    },
+                    .info => {
+                        switch (b) {
+                            ' ', '\t' => {},
+                            else => {
+                                self.state = .info_args;
+                                args_start = i;
+                            },
+                        }
+                    },
+                    .info_args => {
+                        switch (b) {
+                            '\r' => {
+                                drop = 1;
+                            },
+                            '\n' => {
+                                var op = Op{
+                                    .name = .info,
+                                    //.args = undefined,
+                                    .args = buf[args_start .. i - drop],
+                                };
+                                self.handler.on_op(op);
+                                self.state = .start;
+                            },
+                            else => {},
+                        }
+                    },
+                    .info_ => {}, // TODO remove
+                }
+            }
+        }
+
+        fn on_op(self: *Self, op: Op) void {
+            self.handler.on_op(op);
+        }
+    };
+}
+
+pub fn bufferedReader(
+    parent_stream: anytype,
+    op_handler: anytype,
+) OpReader(4096, @TypeOf(parent_stream), @TypeOf(op_handler)) {
+    return .{
+        .parent = parent_stream,
+        .handler = op_handler,
+    };
 }
