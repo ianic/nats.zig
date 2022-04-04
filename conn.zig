@@ -26,195 +26,208 @@ pub fn main() !void {
     }
 }
 
-// const Parser = struct {
-//     state: ParserState,
-//     op: OpName,
-//     msg: []const u8,
+// operation names
+const OpName = enum {
+    info,
+    connect,
+    pub_op, // pub is reserved word
+    sub,
+    unsub,
+    msg,
+    ping,
+    pong,
+    hmsg,
+    ok,
+    err,
+};
 
-//     fn init() Parser {
-//         return Parser{
-//             .state = .start,
-//             .op = undefined,
-//             .msg = undefined,
-//         };
-//     }
+const Op = union(OpName) {
+    info: struct { args: []const u8 },
+    connect,
+    pub_op,
+    sub,
+    unsub,
+    msg: struct { args: []const u8, payload: []const u8 },
+    ping,
+    pong,
+    hmsg,
+    ok,
+    err,
+};
 
-//     fn parse(self: *Parser, buf: []const u8) ParserError!void {
-//         for (buf) |b, i| {
-//             switch (self.state) {
-//                 .start => {
-//                     switch (b) {
-//                         'I', 'i' => self.state = .i,
-//                         else => return ParserError.UnexpectedToken,
-//                     }
-//                 },
-//                 .i => {
-//                     switch (b) {
-//                         'N', 'n' => self.state = .in,
-//                         else => return ParserError.UnexpectedToken,
-//                     }
-//                 },
-//                 .in => {
-//                     switch (b) {
-//                         'F', 'f' => self.state = .inf,
-//                         else => return ParserError.UnexpectedToken,
-//                     }
-//                 },
-//                 .inf => {
-//                     switch (b) {
-//                         'O', 'o' => self.state = .info,
-//                         else => return ParserError.UnexpectedToken,
-//                     }
-//                 },
-//                 .info => {
-//                     switch (b) {
-//                         ' ', '\t' => self.state = .info_,
-//                         else => return ParserError.UnexpectedToken,
-//                     }
-//                 },
-//                 .info_ => {
-//                     self.op = .info;
-//                     self.msg = buf[i..];
-//                     return;
-//                 },
-//                 .info_args => {},
-//             }
-//         }
-//     }
-// };
+const OpParseError = error{
+    UnexpectedToken,
+    MissingArguments,
+};
 
-// pub fn buildParser(comptime callback: fn (op: Op) void) BuildParser(callback) {
-//     return .{ .state = .start };
-// }
+const ParserState = enum {
+    start,
+    i,
+    in,
+    inf,
+    info,
+    info_,     // info operation and space 'INFO '
+    info_args, // info operation arguments
+};
 
-// pub fn BuildParser(
-//     //comptime readFn: fn (buffer: []u8) std.io.FixedBufferStream.ReadError!usize,
-//     comptime callback: fn (op: Op) void,
-// ) type {
-//     return struct {
-//         const Self = @This();
-//         state: ParserState,
+// reads operations from the underlying reader in chunks
+// calls handler for each parsed operation
+pub fn OpReader(
+    comptime buffer_size: usize,
+    comptime ReaderType: type,
+    comptime OpHandlerType: type,
+) type {
+    return struct {
+        parent: ReaderType,
+        handler: OpHandlerType,
+        state: ParserState = .start,
+        alloc: Allocator,
+        args_buf: ?std.ArrayList(u8) = null,
 
-//         fn init() Self {
-//             return Self{
-//                 .state = .start,
-//             };
-//         }
+        //const Error = ReaderType.ReadError || ParserError ;
+        const Self = @This();
 
-//         // fn loop(self: *Self) void {
-//         //     var stratch: [16]u8 = undefined;
-//         //     while (true) {
-//         //         //var tmp = stratch[0..];
-//         //         var bytes_read = try readFn(stratch[0..]);
-//         //         if (bytes_read == 0) {
-//         //             break;
-//         //         }
-//         //         var bytes = stratch[0..bytes_read];
-//         //         try self.parse(bytes);
-//         //         print("bytes read: {d} {d}\n", .{ bytes_read, bytes.len });
-//         //     }
-//         // }
+        pub fn loop(self: *Self) !void {
+            var scratch: [buffer_size]u8 = undefined;
 
-//         fn parse(self: *Self, buf: []const u8) ParserError!void {
-//             var args_start: usize = 0;
-//             var drop: usize = 0;
-//             for (buf) |b, i| {
-//                 switch (self.state) {
-//                     .start => {
-//                         args_start = 0;
-//                         drop = 0;
+            while (true) {
+                var bytes_read = try self.parent.read(scratch[0..]);
+                if (bytes_read == 0) {
+                    return;
+                }
+                try self.parse(scratch[0..bytes_read]);
+            }
+        }
 
-//                         switch (b) {
-//                             'I', 'i' => self.state = .i,
-//                             else => return ParserError.UnexpectedToken,
-//                         }
-//                     },
-//                     .i => {
-//                         switch (b) {
-//                             'N', 'n' => self.state = .in,
-//                             else => return ParserError.UnexpectedToken,
-//                         }
-//                     },
-//                     .in => {
-//                         switch (b) {
-//                             'F', 'f' => self.state = .inf,
-//                             else => return ParserError.UnexpectedToken,
-//                         }
-//                     },
-//                     .inf => {
-//                         switch (b) {
-//                             'O', 'o' => self.state = .info,
-//                             else => return ParserError.UnexpectedToken,
-//                         }
-//                     },
-//                     .info => {
-//                         switch (b) {
-//                             ' ', '\t' => {},
-//                             else => {
-//                                 self.state = .info_args;
-//                                 args_start = i;
-//                             },
-//                         }
-//                     },
-//                     .info_args => {
-//                         switch (b) {
-//                             '\r' => {
-//                                 drop = 1;
-//                             },
-//                             '\n' => {
-//                                 var op = Op{
-//                                     .name = .info,
-//                                     .args = buf[args_start .. i - drop],
-//                                 };
-//                                 callback(op);
-//                                 self.state = .start;
-//                             },
-//                             else => {},
-//                         }
-//                     },
-//                     .info_ => {}, // TODO remove
-//                 }
-//             }
-//         }
-//     };
-// }
+        fn parse(self: *Self, buf: []const u8) !void {
+            var args_start: usize = 0;
+            var drop: usize = 0;
 
-// const Op = struct {
-//     name: OpName,
-//     args: []const u8,
-//     payload: []u8 = undefined,
-//     // alloc: Allocator = undefined,
+            for (buf) |b, i| {
+                switch (self.state) {
+                    .start => {
+                        args_start = 0;
+                        drop = 0;
+                        self.deinit();
 
-//     // const Self = @This();
+                        switch (b) {
+                            'I', 'i' => self.state = .i,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .i => {
+                        switch (b) {
+                            'N', 'n' => self.state = .in,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .in => {
+                        switch (b) {
+                            'F', 'f' => self.state = .inf,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .inf => {
+                        switch (b) {
+                            'O', 'o' => self.state = .info,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .info => {
+                        switch (b) {
+                            ' ', '\t' => {
+                                self.state = .info_;
+                            },
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .info_ => {
+                        switch (b) {
+                            ' ', '\t' => {},
+                            '\r', '\n' => return OpParseError.MissingArguments,
+                            else => {
+                                self.state = .info_args;
+                                args_start = i;
+                            },
+                        }
+                    },
+                    .info_args => {
+                        switch (b) {
+                            '\r' => {
+                                drop = 1;
+                            },
+                            '\n' => {
+                                //print("\n[{d}..{d}]", .{ args_start, i - drop });
+                                try self.on_info(buf[args_start .. i - drop]);
+                                self.state = .start;
+                            },
+                            else => {},
+                        }
+                    },
+                }
+            }
 
-//     // fn copy(self: *Self, alloc: Allocator) !Op {
-//     //     var al = std.ArrayList(u8).init(alloc);
-//     //     try al.appendSlice(self.args);
-//     //     self.alloc = alloc;
-//     //     return Op {
-//     //         .name = self.name,
-//     //         .args = al.toOwnedSlice(),
-//     //     };
-//     // }
+            // check for split buffer scenarios
+            if (self.state == .info_args) {
+                try self.push_args(buf[args_start .. buf.len - drop]);
+            }
+        }
 
-//     // fn deinit(self: *Self) void {
-//     //     self.alloc.free(self.args);
-//     // }
-// };
+        fn on_info(self: *Self, buf: []const u8) !void {
+            if (self.args_buf) |*ab| {
+                try ab.appendSlice(buf);
+                self.handler.on_op(Op{ .info = .{ .args = ab.items } });
+                return;
+            }
+            self.handler.on_op(Op{ .info = .{ .args = buf } });
+        }
 
-// const OpName = enum {
-//     info,
-//     connect,
-//     pub_op, // pub is reserved word
-//     sub,
-//     unsub,
-//     msg,
-//     ping,
-//     pong,
-//     hmsg,
-//     ok,
-//     err,
-// };
+        fn push_args(self: *Self, buf: []const u8) !void {
+            if (self.args_buf) |*ab| {
+                try ab.appendSlice(buf);
+                return;
+            }
+            var ab = std.ArrayList(u8).init(self.alloc);
+            try ab.appendSlice(buf);
+            self.args_buf = ab;
+        }
+
+        fn on_op(self: *Self, op: Op) void {
+            self.handler.on_op(op);
+        }
+
+        fn deinit(self: *Self) void {
+            if (self.args_buf) |*ab| {
+                ab.deinit();
+                self.args_buf = null;
+            }
+        }
+    };
+}
+
+pub fn opReader(
+    alloc: Allocator,
+    parent_stream: anytype,
+    op_handler: anytype,
+) OpReader(4096, @TypeOf(parent_stream), @TypeOf(op_handler)) {
+    return .{
+        .alloc = alloc,
+        .parent = parent_stream,
+        .handler = op_handler,
+    };
+}
+
+pub fn tinyOpReader(
+    alloc: Allocator,
+    parent_stream: anytype,
+    op_handler: anytype,
+) OpReader(16, @TypeOf(parent_stream), @TypeOf(op_handler)) {
+    return .{
+        .alloc = alloc,
+        .parent = parent_stream,
+        .handler = op_handler,
+    };
+}
 
 // TODO check this empty string idea, trying to avoid undefined
 const empty_str = ([_]u8{})[0..];
@@ -302,7 +315,7 @@ test "parser info message" {
         if (test_parse_line(buf)) {
             unreachable;
         } else |err| switch (err) {
-            ParserError.UnexpectedToken => {},
+            OpParseError.UnexpectedToken => {},
             else => unreachable,
         }
     }
@@ -315,7 +328,7 @@ test "parser info message" {
         if (test_parse_line(buf)) {
             unreachable;
         } else |err| switch (err) {
-            ParserError.MissingArguments => {},
+            OpParseError.MissingArguments => {},
             else => unreachable,
         }
     }
@@ -325,7 +338,9 @@ fn test_parse_line(buf: []const u8) !Op {
     var noopHandler = struct {
         last_op: Op = undefined,
         const Self = @This();
-        fn on_op(self: *Self, op: Op) void { self.last_op = op; }
+        fn on_op(self: *Self, op: Op) void {
+            self.last_op = op;
+        }
     }{};
 
     var opr = opReader(testing.allocator, std.io.fixedBufferStream(buf), &noopHandler);
@@ -360,10 +375,6 @@ test "decode server info message body JSON into ServerInfo struct" {
     try expect(mem.eql(u8, im.connect_urls[2], "192.168.192.1:4333"));
 }
 
-// fn printOp(op: Op) void {
-//     print("op: {}\nargs: {s}\n", .{ op.name, op.args });
-// }
-
 test "operation reader" {
     var clt = OperationsCollector.init(std.testing.allocator);
     defer clt.deinit();
@@ -389,13 +400,12 @@ test "operation reader with buffer overflow" {
     try assert_info_operations_parsed(&clt);
 }
 
-test "operation reader with buffer overflow 2" {
+test "operation reader with buffer overflow for different buffer sizes" {
     var clt = struct {
         no: usize = 1,
         const Self = @This();
 
         fn on_op(self: *Self, op: Op) void {
-            //print("\nargs: {d} {d} '{s}'", .{ self.no, op.info.args.len, op.info.args });
             expectEqual(self.no, op.info.args.len) catch {
                 unreachable;
             };
@@ -429,8 +439,6 @@ test "operation reader with buffer overflow 2" {
     var br = tinyOpReader(testing.allocator, stream, &clt);
     defer br.deinit();
     try br.loop();
-
-    //try assert_info_operations_parsed(&clt);
 }
 
 fn test_info_operations() []const u8 {
@@ -484,15 +492,6 @@ const OperationsCollector = struct {
                 self.ops.append(op) catch {};
             },
         }
-        // var al = std.ArrayList(u8).init(std.testing.allocator);
-        // al.appendSlice(op.args) catch {};
-        // var op2 = Op{
-        //     .name = op.name,
-        //     .args = al.toOwnedSlice(),
-        // };
-        // //var op2 = try &op.copy(std.testing.allocator) catch {};
-        // self.ops.append(op2) catch {};
-        // //print("op: {}\nargs: {s}\n", .{ op.name, op.args });
     }
 
     fn deinit(self: *Self) void {
@@ -507,222 +506,3 @@ const OperationsCollector = struct {
         self.ops.deinit();
     }
 };
-
-const OpName = enum {
-    info,
-    connect,
-    pub_op, // pub is reserved word
-    sub,
-    unsub,
-    msg,
-    ping,
-    pong,
-    hmsg,
-    ok,
-    err,
-};
-
-const Op = union(OpName) {
-    info: struct { args: []const u8 },
-    connect,
-    pub_op,
-    sub,
-    unsub,
-    msg: struct { args: []const u8, payload: []const u8 },
-    ping,
-    pong,
-    hmsg,
-    ok,
-    err,
-};
-
-const ParserError = error{
-    UnexpectedToken,
-    MissingArguments,
-};
-
-const ParserState = enum {
-    start,
-    i,
-    in,
-    inf,
-    info,
-    info_,
-    info_args,
-};
-
-// reads operations from the underlying reader in chunks
-// calls handler for each parsed operation
-pub fn OpReader(
-    comptime buffer_size: usize,
-    comptime ReaderType: type,
-    comptime OpHandlerType: type,
-) type {
-    return struct {
-        parent: ReaderType,
-        handler: OpHandlerType,
-        state: ParserState = .start,
-        alloc: Allocator,
-        args_buf: ?std.ArrayList(u8) = null,
-
-        //const Error = ReaderType.ReadError || ParserError ;
-        const Self = @This();
-
-        pub fn loop(self: *Self) !void {
-            var scratch: [buffer_size]u8 = undefined;
-
-            while (true) {
-                var bytes_read = try self.parent.read(scratch[0..]);
-                if (bytes_read == 0) {
-                    return;
-                }
-                try self.parse(scratch[0..bytes_read]);
-            }
-        }
-
-        fn parse(self: *Self, buf: []const u8) !void {
-            var args_start: usize = 0;
-            var drop: usize = 0;
-
-            for (buf) |b, i| {
-                switch (self.state) {
-                    .start => {
-                        args_start = 0;
-                        drop = 0;
-                        self.deinit();
-
-                        switch (b) {
-                            'I', 'i' => self.state = .i,
-                            else => return ParserError.UnexpectedToken,
-                        }
-                    },
-                    .i => {
-                        switch (b) {
-                            'N', 'n' => self.state = .in,
-                            else => return ParserError.UnexpectedToken,
-                        }
-                    },
-                    .in => {
-                        switch (b) {
-                            'F', 'f' => self.state = .inf,
-                            else => return ParserError.UnexpectedToken,
-                        }
-                    },
-                    .inf => {
-                        switch (b) {
-                            'O', 'o' => self.state = .info,
-                            else => return ParserError.UnexpectedToken,
-                        }
-                    },
-                    .info => {
-                        switch (b) {
-                            ' ', '\t' => {
-                                self.state = .info_;
-                            },
-                            else => return ParserError.UnexpectedToken,
-                        }
-                    },
-                    .info_ => {
-                        switch (b) {
-                            ' ', '\t' => {},
-                            '\r', '\n' => return ParserError.MissingArguments,
-                            else => {
-                                self.state = .info_args;
-                                args_start = i;
-                            },
-                        }
-                    },
-                    .info_args => {
-                        switch (b) {
-                            '\r' => {
-                                drop = 1;
-                            },
-                            '\n' => {
-                                //print("\n[{d}..{d}]", .{ args_start, i - drop });
-                                try self.on_info(buf[args_start .. i - drop]);
-                                self.state = .start;
-                            },
-                            else => {},
-                        }
-                    },
-                }
-            }
-
-            // check for split buffer scenarios
-            if (self.state == .info_args) {
-                try self.push_args(buf[args_start .. buf.len - drop]);
-            }
-        }
-
-        fn on_info(self: *Self, buf: []const u8) !void {
-            if (self.args_buf) |*ab| {
-                try ab.appendSlice(buf);
-                self.handler.on_op(Op{ .info = .{ .args = ab.items } });
-                return;
-            }
-            self.handler.on_op(Op{ .info = .{ .args = buf } });
-        }
-
-        fn push_args(self: *Self, buf: []const u8) !void {
-            if (self.args_buf) |*ab| {
-                try ab.appendSlice(buf);
-                return;
-            }
-            var ab = std.ArrayList(u8).init(self.alloc);
-            try ab.appendSlice(buf);
-            self.args_buf = ab;
-        }
-
-        fn on_op(self: *Self, op: Op) void {
-            self.handler.on_op(op);
-        }
-
-        fn deinit(self: *Self) void {
-            if (self.args_buf) |*ab| {
-                ab.deinit();
-                self.args_buf = null;
-            }
-        }
-    };
-}
-
-pub fn opReader(
-    alloc: Allocator,
-    parent_stream: anytype,
-    op_handler: anytype,
-) OpReader(4096, @TypeOf(parent_stream), @TypeOf(op_handler)) {
-    return .{
-        .alloc = alloc,
-        .parent = parent_stream,
-        .handler = op_handler,
-    };
-}
-
-pub fn tinyOpReader(
-    alloc: Allocator,
-    parent_stream: anytype,
-    op_handler: anytype,
-) OpReader(16, @TypeOf(parent_stream), @TypeOf(op_handler)) {
-    return .{
-        .alloc = alloc,
-        .parent = parent_stream,
-        .handler = op_handler,
-    };
-}
-
-// test "experiment" {
-//     var i = Op2{ .info = "a" };
-
-//     switch (i) {
-//         Op2.info => |value| print("\nvalue: {s}\n", .{value}),
-//         else => unreachable,
-//     }
-
-//     var j = Op2{ .msg = .{ .args = "argssss", .payload = "payloadddd" } };
-
-//     switch (j) {
-//         Op2.info => |value| print("\nvalue: {s}\n", .{value}),
-//         Op2.msg => |m| print("\n msg: {s} {s}\n", .{ m.args, m.payload }),
-//         else => unreachable,
-//     }
-// }
