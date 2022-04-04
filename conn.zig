@@ -432,7 +432,7 @@ test "operation reader" {
     defer clt.deinit();
 
     var stream = std.io.fixedBufferStream(test_info_operations());
-    var br = opReader(stream, &clt);
+    var br = opReader(testing.allocator, stream, &clt);
     try br.loop();
 
     try assert_info_operations_parsed(&clt);
@@ -443,7 +443,7 @@ test "operation reader with buffer overflow" {
     defer clt.deinit();
 
     var stream = std.io.fixedBufferStream(test_info_operations());
-    var br = tinyOpReader(stream, &clt);
+    var br = tinyOpReader(testing.allocator, stream, &clt);
     defer br.deinit();
     try br.loop();
 
@@ -507,8 +507,8 @@ const OperationsCollector = struct {
     }
 };
 
-// reads operations from the underlying reader
-// calls op handler for each parsed operation
+// reads operations from the underlying reader in chunks
+// calls handler for each parsed operation
 pub fn OpReader(
     comptime buffer_size: usize,
     comptime ReaderType: type,
@@ -518,6 +518,7 @@ pub fn OpReader(
         parent: ReaderType,
         handler: OpHandlerType,
         state: ParserState = .start,
+        alloc: Allocator,
         args_buf: ?std.ArrayList(u8) = null,
 
         //const Error = ReaderType.ReadError || ParserError ;
@@ -538,6 +539,7 @@ pub fn OpReader(
         fn parse(self: *Self, buf: []const u8) !void {
             var args_start: usize = 0;
             var drop: usize = 0;
+
             for (buf) |b, i| {
                 switch (self.state) {
                     .start => {
@@ -593,34 +595,37 @@ pub fn OpReader(
                 }
             }
 
-            // we are in the middle if collecting args
+            // check for split buffer scenarios
             if (self.state == .info_args) {
-                try self.push_args(buf[args_start..buf.len-drop]);
+                try self.push_args(buf[args_start .. buf.len - drop]);
             }
         }
 
         fn on_info(self: *Self, buf: []const u8) !void {
-            if (self.args_buf == null) {
+            if (self.args_buf) |*ab| {
+                try ab.appendSlice(buf);
                 var op = Op{
                     .name = .info,
-                    .args = buf,
+                    .args = ab.items,
                 };
                 self.handler.on_op(op);
                 return;
             }
-            try self.push_args(buf);
             var op = Op{
                 .name = .info,
-                .args = self.args_buf.?.items,
+                .args = buf,
             };
             self.handler.on_op(op);
         }
 
         fn push_args(self: *Self, buf: []const u8) !void {
-            if (self.args_buf == null) {
-                self.args_buf = std.ArrayList(u8).init(std.testing.allocator); // TODO allocator
+            if (self.args_buf) |*ab| {
+                try ab.appendSlice(buf);
+                return;
             }
-            try self.args_buf.?.appendSlice(buf);
+            var ab = std.ArrayList(u8).init(self.alloc);
+            try ab.appendSlice(buf);
+            self.args_buf = ab;
         }
 
         fn on_op(self: *Self, op: Op) void {
@@ -637,21 +642,72 @@ pub fn OpReader(
 }
 
 pub fn opReader(
+    alloc: Allocator,
     parent_stream: anytype,
     op_handler: anytype,
 ) OpReader(4096, @TypeOf(parent_stream), @TypeOf(op_handler)) {
     return .{
+        .alloc = alloc,
         .parent = parent_stream,
         .handler = op_handler,
     };
 }
 
 pub fn tinyOpReader(
+    alloc: Allocator,
     parent_stream: anytype,
     op_handler: anytype,
 ) OpReader(16, @TypeOf(parent_stream), @TypeOf(op_handler)) {
     return .{
+        .alloc = alloc,
         .parent = parent_stream,
         .handler = op_handler,
     };
+}
+
+
+const OpName2 = enum {
+    info,
+    connect,
+    pub_op, // pub is reserved word
+    sub,
+    unsub,
+    msg,
+    ping,
+    pong,
+    hmsg,
+    ok,
+    err,
+};
+
+const Op2 = union(OpName2) {
+    info: []const u8,
+    connect,
+    pub_op,
+    sub,
+    unsub,
+    msg: struct {args: []const u8, payload: []const u8},
+    ping,
+    pong,
+    hmsg,
+    ok,
+    err,
+};
+
+test "experiment" {
+    var i = Op2{.info = "a"};
+
+    switch (i) {
+        Op2.info => |value| print("\nvalue: {s}\n", .{value}),
+        else => unreachable,
+    }
+
+    var j = Op2{.msg = .{.args = "argssss", .payload = "payloadddd"}};
+
+    switch (j) {
+        Op2.info => |value| print("\nvalue: {s}\n", .{value}),
+        Op2.msg => |m| print("\n msg: {s} {s}\n", .{m.args, m.payload}),
+        else => unreachable,
+    }
+
 }
