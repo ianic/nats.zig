@@ -183,6 +183,23 @@ const Op = struct {
     name: OpName,
     args: []const u8,
     payload: []u8 = undefined,
+    // alloc: Allocator = undefined,
+
+    // const Self = @This();
+
+    // fn copy(self: *Self, alloc: Allocator) !Op {
+    //     var al = std.ArrayList(u8).init(alloc);
+    //     try al.appendSlice(self.args);
+    //     self.alloc = alloc;
+    //     return Op {
+    //         .name = self.name,
+    //         .args = al.toOwnedSlice(),
+    //     };
+    // }
+
+    // fn deinit(self: *Self) void {
+    //     self.alloc.free(self.args);
+    // }
 };
 
 const OpName = enum {
@@ -389,41 +406,74 @@ test "build parser" {
     try expect(mem.eql(u8, c.ops.items[2].args, "foo bar"));
 }
 
-test "fixed buffer" {
-    const buf =
-        \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
-        \\INFO foo
-        \\INFO foo bar
-        \\
-    ;
+// test "fixed buffer" {
+//     const buf =
+//         \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
+//         \\INFO foo
+//         \\INFO foo bar
+//         \\
+//     ;
 
-    var stream = std.io.fixedBufferStream(buf);
-    var stratch: [16]u8 = undefined;
-    while (true) {
-        //var tmp = stratch[0..];
-        var bytes_read = try stream.read(stratch[0..]);
-        if (bytes_read == 0) {
-            break;
-        }
-        var bytes = stratch[0..bytes_read];
-        print("bytes read: {d} {d}\n", .{ bytes_read, bytes.len });
-    }
+//     var stream = std.io.fixedBufferStream(buf);
+//     var stratch: [16]u8 = undefined;
+//     while (true) {
+//         //var tmp = stratch[0..];
+//         var bytes_read = try stream.read(stratch[0..]);
+//         if (bytes_read == 0) {
+//             break;
+//         }
+//         var bytes = stratch[0..bytes_read];
+//         print("bytes read: {d} {d}\n", .{ bytes_read, bytes.len });
+//     }
+// }
+
+test "operation reader" {
+    var clt = OperationsCollector.init(std.testing.allocator);
+    defer clt.deinit();
+
+    var stream = std.io.fixedBufferStream(test_info_operations());
+    var br = opReader(stream, &clt);
+    try br.loop();
+
+    try assert_info_operations_parsed(&clt);
 }
 
-test "build parser 2" {
+test "operation reader with buffer overflow" {
+    var clt = OperationsCollector.init(std.testing.allocator);
+    defer clt.deinit();
+
+    var stream = std.io.fixedBufferStream(test_info_operations());
+    var br = tinyOpReader(stream, &clt);
+    defer br.deinit();
+    try br.loop();
+
+    //try expectEqual(clt.ops.items.len, 3);
+    //print("args[0]: {s}\n", .{clt.ops.items[0].args});
+    try assert_info_operations_parsed(&clt);
+}
+
+fn test_info_operations() []const u8 {
     const buf =
         \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
         \\INFO foo
         \\INFO foo bar
         \\
     ;
+    return buf;
+}
 
-    var c = OperationsCollector.init(std.testing.allocator);
-    defer c.deinit();
+fn assert_info_operations_parsed(clt: *OperationsCollector) !void {
+    try expectEqual(clt.ops.items.len, 3);
+    try expectEqual(clt.ops.items[0].name, .info);
+    try expectEqual(clt.ops.items[0].args[0], '{');
+    try expectEqual(clt.ops.items[0].args[278], '}');
+    try expectEqual(clt.ops.items[0].args.len, 279);
 
-    var stream = std.io.fixedBufferStream(buf);
-    var br = bufferedReader(stream, &c);
-    try br.loop();
+    try expectEqual(clt.ops.items[1].name, .info);
+    try expect(mem.eql(u8, clt.ops.items[1].args, "foo"));
+
+    try expectEqual(clt.ops.items[2].name, .info);
+    try expect(mem.eql(u8, clt.ops.items[2].args, "foo bar"));
 }
 
 const OperationsCollector = struct {
@@ -437,11 +487,22 @@ const OperationsCollector = struct {
     }
 
     fn on_op(self: *Self, op: Op) void {
-        self.ops.append(op) catch {};
-        print("op: {}\nargs: {s}\n", .{ op.name, op.args });
+        var al = std.ArrayList(u8).init(std.testing.allocator);
+        al.appendSlice(op.args) catch {};
+        var op2 = Op{
+            .name = op.name,
+            .args = al.toOwnedSlice(),
+        };
+        //var op2 = try &op.copy(std.testing.allocator) catch {};
+        self.ops.append(op2) catch {};
+        //print("op: {}\nargs: {s}\n", .{ op.name, op.args });
     }
 
     fn deinit(self: *Self) void {
+        for (self.ops.items) |op| {
+            std.testing.allocator.free(op.args);
+            //op.deinit();
+        }
         self.ops.deinit();
     }
 };
@@ -457,11 +518,12 @@ pub fn OpReader(
         parent: ReaderType,
         handler: OpHandlerType,
         state: ParserState = .start,
+        args_buf: ?std.ArrayList(u8) = null,
 
-        const Error = ReaderType.ReadError || ParserError;
+        //const Error = ReaderType.ReadError || ParserError ;
         const Self = @This();
 
-        pub fn loop(self: *Self) Error!void {
+        pub fn loop(self: *Self) !void {
             var scratch: [buffer_size]u8 = undefined;
 
             while (true) {
@@ -473,7 +535,7 @@ pub fn OpReader(
             }
         }
 
-        fn parse(self: *Self, buf: []const u8) ParserError!void {
+        fn parse(self: *Self, buf: []const u8) !void {
             var args_start: usize = 0;
             var drop: usize = 0;
             for (buf) |b, i| {
@@ -481,6 +543,7 @@ pub fn OpReader(
                     .start => {
                         args_start = 0;
                         drop = 0;
+                        self.deinit();
 
                         switch (b) {
                             'I', 'i' => self.state = .i,
@@ -520,12 +583,7 @@ pub fn OpReader(
                                 drop = 1;
                             },
                             '\n' => {
-                                var op = Op{
-                                    .name = .info,
-                                    //.args = undefined,
-                                    .args = buf[args_start .. i - drop],
-                                };
-                                self.handler.on_op(op);
+                                try self.on_info(buf[args_start .. i - drop]);
                                 self.state = .start;
                             },
                             else => {},
@@ -534,18 +592,64 @@ pub fn OpReader(
                     .info_ => {}, // TODO remove
                 }
             }
+
+            // we are in the middle if collecting args
+            if (self.state == .info_args) {
+                try self.push_args(buf[args_start..buf.len-drop]);
+            }
+        }
+
+        fn on_info(self: *Self, buf: []const u8) !void {
+            if (self.args_buf == null) {
+                var op = Op{
+                    .name = .info,
+                    .args = buf,
+                };
+                self.handler.on_op(op);
+                return;
+            }
+            try self.push_args(buf);
+            var op = Op{
+                .name = .info,
+                .args = self.args_buf.?.items,
+            };
+            self.handler.on_op(op);
+        }
+
+        fn push_args(self: *Self, buf: []const u8) !void {
+            if (self.args_buf == null) {
+                self.args_buf = std.ArrayList(u8).init(std.testing.allocator); // TODO allocator
+            }
+            try self.args_buf.?.appendSlice(buf);
         }
 
         fn on_op(self: *Self, op: Op) void {
             self.handler.on_op(op);
         }
+
+        fn deinit(self: *Self) void {
+            if (self.args_buf) |*ab| {
+                ab.deinit();
+                self.args_buf = null;
+            }
+        }
     };
 }
 
-pub fn bufferedReader(
+pub fn opReader(
     parent_stream: anytype,
     op_handler: anytype,
 ) OpReader(4096, @TypeOf(parent_stream), @TypeOf(op_handler)) {
+    return .{
+        .parent = parent_stream,
+        .handler = op_handler,
+    };
+}
+
+pub fn tinyOpReader(
+    parent_stream: anytype,
+    op_handler: anytype,
+) OpReader(16, @TypeOf(parent_stream), @TypeOf(op_handler)) {
     return .{
         .parent = parent_stream,
         .handler = op_handler,
