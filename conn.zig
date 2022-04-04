@@ -2,6 +2,7 @@ const std = @import("std");
 const print = std.debug.print;
 const net = std.net;
 const Allocator = std.mem.Allocator;
+const bufferStream = std.io.fixedBufferStream;
 
 pub fn main() !void {
     const addr = try net.Address.parseIp4("127.0.0.1", 4222);
@@ -66,7 +67,7 @@ const ParserState = enum {
     in,
     inf,
     info,
-    info_,     // info operation and space 'INFO '
+    info_, // info operation and space 'INFO '
     info_args, // info operation arguments
 };
 
@@ -176,10 +177,10 @@ pub fn OpReader(
         fn on_info(self: *Self, buf: []const u8) !void {
             if (self.args_buf) |*ab| {
                 try ab.appendSlice(buf);
-                self.handler.on_op(Op{ .info = .{ .args = ab.items } });
+                try self.handler.on_op(Op{ .info = .{ .args = ab.items } });
                 return;
             }
-            self.handler.on_op(Op{ .info = .{ .args = buf } });
+            try self.handler.on_op(Op{ .info = .{ .args = buf } });
         }
 
         fn push_args(self: *Self, buf: []const u8) !void {
@@ -190,10 +191,6 @@ pub fn OpReader(
             var ab = std.ArrayList(u8).init(self.alloc);
             try ab.appendSlice(buf);
             self.args_buf = ab;
-        }
-
-        fn on_op(self: *Self, op: Op) void {
-            self.handler.on_op(op);
         }
 
         fn deinit(self: *Self) void {
@@ -334,21 +331,7 @@ test "parser info message" {
     }
 }
 
-fn test_parse_line(buf: []const u8) !Op {
-    var noopHandler = struct {
-        last_op: Op = undefined,
-        const Self = @This();
-        fn on_op(self: *Self, op: Op) void {
-            self.last_op = op;
-        }
-    }{};
-
-    var opr = opReader(testing.allocator, std.io.fixedBufferStream(buf), &noopHandler);
-    try opr.loop();
-    return noopHandler.last_op;
-}
-
-test "decode server info message body JSON into ServerInfo struct" {
+test "decode server info operation JSON args into ServerInfo struct" {
     const buf =
         \\{"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
     ;
@@ -376,39 +359,59 @@ test "decode server info message body JSON into ServerInfo struct" {
 }
 
 test "operation reader" {
-    var clt = OperationsCollector.init(std.testing.allocator);
-    defer clt.deinit();
-
-    var stream = std.io.fixedBufferStream(test_info_operations());
     // opReader has buffer of 4096 bytes, big enough for whole stream of test data
-    var br = opReader(testing.allocator, stream, &clt);
-    try br.loop();
-
-    try assert_info_operations_parsed(&clt);
+    var opr = opReader(testing.allocator, bufferStream(test_info_ops), &assert_info_ops);
+    defer opr.deinit();
+    try opr.loop();
 }
 
 test "operation reader with buffer overflow" {
-    var clt = OperationsCollector.init(std.testing.allocator);
-    defer clt.deinit();
-
-    var stream = std.io.fixedBufferStream(test_info_operations());
     // tinyOpReader has buffer of 16 bytes, overflow occures
-    var br = tinyOpReader(testing.allocator, stream, &clt);
-    defer br.deinit();
-    try br.loop();
-
-    try assert_info_operations_parsed(&clt);
+    var opr = tinyOpReader(testing.allocator, bufferStream(test_info_ops), &assert_info_ops);
+    defer opr.deinit();
+    try opr.loop();
 }
 
+// define info operations for use in test
+const test_info_ops =
+    \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
+    \\INFO foo
+    \\INFO foo bar
+    \\
+    ;
+
+// assert parsed operations based test_info_ops
+var assert_info_ops = struct {
+    no: usize = 0,
+    const Self = @This();
+
+    fn on_op(self: *Self, op: Op) !void {
+        switch (self.no) {
+            0 => {
+                try expectEqual(op.info.args[0], '{');
+                try expectEqual(op.info.args[278], '}');
+                try expectEqual(op.info.args.len, 279);
+            },
+            1 => {
+                try expect(mem.eql(u8, op.info.args, "foo"));
+            },
+            2 => {
+                try expect(mem.eql(u8, op.info.args, "foo bar"));
+            },
+            else => {},
+        }
+        self.no += 1;
+    }
+}{};
+
+
 test "operation reader with buffer overflow for different buffer sizes" {
-    var clt = struct {
+    var handler = struct {
         no: usize = 1,
         const Self = @This();
 
-        fn on_op(self: *Self, op: Op) void {
-            expectEqual(self.no, op.info.args.len) catch {
-                unreachable;
-            };
+        fn on_op(self: *Self, op: Op) !void {
+            try expectEqual(self.no, op.info.args.len);
             self.no += 1;
         }
     }{};
@@ -434,75 +437,24 @@ test "operation reader with buffer overflow for different buffer sizes" {
         try cases.appendSlice("\n");
     }
 
-    var stream = std.io.fixedBufferStream(cases.items);
+    var stream = bufferStream(cases.items);
     // tinyOpReader has buffer of 16 bytes, overflow occures
-    var br = tinyOpReader(testing.allocator, stream, &clt);
+    var br = tinyOpReader(testing.allocator, stream, &handler);
     defer br.deinit();
     try br.loop();
 }
 
-fn test_info_operations() []const u8 {
-    const buf =
-        \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
-        \\INFO foo
-        \\INFO foo bar
-        \\
-    ;
-    return buf;
-}
-
-fn assert_info_operations_parsed(clt: *OperationsCollector) !void {
-    var ops = clt.ops.items;
-    try expectEqual(ops.len, 3);
-
-    var op = ops[0];
-    try expectEqual(op.info.args[0], '{');
-    try expectEqual(op.info.args[278], '}');
-    try expectEqual(op.info.args.len, 279);
-
-    op = ops[1];
-    try expect(mem.eql(u8, op.info.args, "foo"));
-
-    op = ops[2];
-    try expect(mem.eql(u8, op.info.args, "foo bar"));
-}
-
-const OperationsCollector = struct {
-    ops: std.ArrayList(Op),
-    alloc: Allocator,
-
-    const Self = @This();
-
-    fn init(alloc: Allocator) Self {
-        return Self{
-            .alloc = alloc,
-            .ops = std.ArrayList(Op).init(alloc),
-        };
-    }
-
-    fn on_op(self: *Self, op: Op) void {
-        switch (op) {
-            Op.info => |i| {
-                // make copy of args buffer
-                var al = std.ArrayList(u8).init(self.alloc);
-                al.appendSlice(i.args) catch {};
-                self.ops.append(Op{ .info = .{ .args = al.toOwnedSlice() } }) catch {};
-            },
-            else => {
-                self.ops.append(op) catch {};
-            },
+// test helper, parse one line and return parsed operation
+fn test_parse_line(buf: []const u8) !Op {
+    var handler = struct {
+        last_op: Op = undefined,
+        const Self = @This();
+        fn on_op(self: *Self, op: Op) !void {
+            self.last_op = op;
         }
-    }
+    }{};
 
-    fn deinit(self: *Self) void {
-        for (self.ops.items) |op| {
-            switch (op) {
-                Op.info => |i| {
-                    self.alloc.free(i.args);
-                },
-                else => {},
-            }
-        }
-        self.ops.deinit();
-    }
-};
+    var opr = opReader(testing.allocator, bufferStream(buf), &handler);
+    try opr.loop();
+    return handler.last_op;
+}
