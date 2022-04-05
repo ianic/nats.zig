@@ -60,6 +60,7 @@ const OpParseError = error{
     UnexpectedToken,
     MissingArguments,
     OutOfMemory,
+    UnexpectedMsgArgs,
 
     TestUnexpectedResult,
     TestExpectedEqual,
@@ -379,6 +380,66 @@ pub fn OpReader(
         }
     };
 }
+// reference implementation: https://github.com/nats-io/nats.go/blob/8af932f2076b3cab1a9a2f5aa2d9b59de2f1db6b/parser.go#L434
+fn parse_msg_args(buf: []const u8) !MsgArgs {
+    var parts: [4][]const u8 = .{empty_str} ** 4;
+    var part_no: usize = 0;
+
+    var start: usize = 0;
+    var started: bool = false;
+    for (buf) |b, i| {
+        switch (b) {
+            ' ', '\t', '\r', '\n' => {
+                if (started) {
+                    if (part_no > 3) {
+                        return OpParseError.UnexpectedMsgArgs;
+                    }
+                    parts[part_no] = buf[start..i];
+                    part_no += 1;
+                    started = false;
+                }
+            },
+            else => {
+                if (!started) {
+                    started = true;
+                    start = i;
+                }
+            },
+        }
+    }
+    if (started) {
+        if (part_no > 3) {
+            return OpParseError.UnexpectedMsgArgs;
+        }
+        parts[part_no] = buf[start..];
+        part_no += 1;
+    }
+
+    if (part_no == 3) {
+        return MsgArgs{
+            .subject = parts[0],
+            .sid = try std.fmt.parseUnsigned(u64, parts[1], 10),
+            .reply = null,
+            .size = try std.fmt.parseUnsigned(u64, parts[2], 10),
+        };
+    }
+    if (part_no == 4) {
+        return MsgArgs{
+            .subject = parts[0],
+            .sid = try std.fmt.parseUnsigned(u64, parts[1], 10),
+            .reply = parts[2],
+            .size = try std.fmt.parseUnsigned(u64, parts[3], 10),
+        };
+    }
+    return OpParseError.UnexpectedMsgArgs;
+}
+
+const MsgArgs = struct {
+    subject: []const u8,
+    sid: u64,
+    reply: ?[]const u8,
+    size: u64,
+};
 
 pub fn opReader(
     alloc: Allocator,
@@ -677,4 +738,48 @@ fn test_parse_line(buf: []const u8) !Op {
 }
 
 test "parse msg args" {
+    var ma = try parse_msg_args("foo.bar 9 11");
+    try expect(mem.eql(u8, ma.subject, "foo.bar"));
+    try expect(ma.reply == null);
+    try expectEqual(ma.sid, 9);
+    try expectEqual(ma.size, 11);
+
+    ma = try parse_msg_args("bar.foo 10 INBOX.34 12");
+    try expect(mem.eql(u8, ma.subject, "bar.foo"));
+    try expect(mem.eql(u8, ma.reply.?, "INBOX.34"));
+    try expectEqual(ma.sid, 10);
+    try expectEqual(ma.size, 12);
+
+    ma = try parse_msg_args("bar.foo.bar    11\tINBOX.35           13 ");
+    try expect(mem.eql(u8, ma.subject, "bar.foo.bar"));
+    try expect(mem.eql(u8, ma.reply.?, "INBOX.35"));
+    try expectEqual(ma.sid, 11);
+    try expectEqual(ma.size, 13);
+
+    const cases = [_][]const u8{
+        "bar.foo 10 INBOX.34 extra.arg 12", // too many arguments
+        "bar.foo 12", // too few arguments
+    };
+    for (cases) |case| {
+        if (parse_msg_args(case)) {
+            unreachable;
+        } else |err| switch (err) {
+            OpParseError.UnexpectedMsgArgs => {},
+            else => unreachable,
+        }
+    }
+
+    const not_a_number_cases = [_][]const u8{
+        "foo.bar 9 size_not_a_number",
+        "bar.foo sid_not_a_number, 11",
+    };
+    for (not_a_number_cases) |case| {
+        if (parse_msg_args(case)) {
+            unreachable;
+        } else |err| switch (err) {
+            std.fmt.ParseIntError.InvalidCharacter => {},
+            else => unreachable,
+        }
+    }
+
 }
