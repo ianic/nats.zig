@@ -59,6 +59,15 @@ const Op = union(OpName) {
 const OpParseError = error{
     UnexpectedToken,
     MissingArguments,
+    OutOfMemory,
+
+    TestUnexpectedResult,
+    TestExpectedEqual,
+};
+
+const OpHandlerError = error{
+    TestUnexpectedResult,
+    TestExpectedEqual,
 };
 
 const ParserState = enum {
@@ -69,6 +78,13 @@ const ParserState = enum {
     info,
     info_, // info operation and space 'INFO '
     info_args, // info operation arguments
+    p,
+    pi,
+    pin,
+    ping,
+    po,
+    pon,
+    pong,
 };
 
 // reads operations from the underlying reader in chunks
@@ -88,7 +104,7 @@ pub fn OpReader(
         //const Error = ReaderType.ReadError || ParserError ;
         const Self = @This();
 
-        pub fn loop(self: *Self) !void {
+        pub fn loop(self: *Self) OpParseError!void {
             var scratch: [buffer_size]u8 = undefined;
 
             while (true) {
@@ -100,7 +116,7 @@ pub fn OpReader(
             }
         }
 
-        fn parse(self: *Self, buf: []const u8) !void {
+        fn parse(self: *Self, buf: []const u8) OpParseError!void {
             var args_start: usize = 0;
             var drop: usize = 0;
 
@@ -109,11 +125,63 @@ pub fn OpReader(
                     .start => {
                         args_start = 0;
                         drop = 0;
-                        self.deinit();
+                        self.deinit_args();
 
                         switch (b) {
+                            '\r', '\n' => {},
                             'I', 'i' => self.state = .i,
+                            'P', 'p' => self.state = .p,
                             else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .p => {
+                        switch (b) {
+                            'I', 'i' => self.state = .pi,
+                            'O', 'o' => self.state = .po,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .pi => {
+                        switch (b) {
+                            'N', 'n' => self.state = .pin,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .pin => {
+                        switch (b) {
+                            'G', 'g' => self.state = .ping,
+
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .ping => {
+                        switch (b) {
+                            '\n' => {
+                                try self.handler.on_op(Op.ping);
+                                self.state = .start;
+                            },
+                            else => {},
+                        }
+                    },
+                    .po => {
+                        switch (b) {
+                            'N', 'n' => self.state = .pon,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .pon => {
+                        switch (b) {
+                            'G', 'g' => self.state = .pong,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .pong => {
+                        switch (b) {
+                            '\n' => {
+                                try self.handler.on_op(Op.pong);
+                                self.state = .start;
+                            },
+                            else => {},
                         }
                     },
                     .i => {
@@ -174,7 +242,7 @@ pub fn OpReader(
             }
         }
 
-        fn on_info(self: *Self, buf: []const u8) !void {
+        fn on_info(self: *Self, buf: []const u8) OpParseError!void {
             if (self.args_buf) |*ab| {
                 try ab.appendSlice(buf);
                 try self.handler.on_op(Op{ .info = .{ .args = ab.items } });
@@ -183,7 +251,7 @@ pub fn OpReader(
             try self.handler.on_op(Op{ .info = .{ .args = buf } });
         }
 
-        fn push_args(self: *Self, buf: []const u8) !void {
+        fn push_args(self: *Self, buf: []const u8) OpParseError!void {
             if (self.args_buf) |*ab| {
                 try ab.appendSlice(buf);
                 return;
@@ -193,11 +261,15 @@ pub fn OpReader(
             self.args_buf = ab;
         }
 
-        fn deinit(self: *Self) void {
+        fn deinit_args(self: *Self) void {
             if (self.args_buf) |*ab| {
                 ab.deinit();
                 self.args_buf = null;
             }
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.deinit_args();
         }
     };
 }
@@ -278,7 +350,7 @@ const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const mem = std.mem;
 
-test "parser info message" {
+test "parser info operation" {
     const Case = struct {
         buf: []const u8,
         args_buf_len: u32,
@@ -331,6 +403,30 @@ test "parser info message" {
     }
 }
 
+test "parse ping operation" {
+    const pings = [_][]const u8{
+        "PING\r\n",
+        "ping\n",
+        "ping     \n",
+    };
+    for (pings) |buf| {
+        var op = try test_parse_line(buf);
+        try expect(op == .ping);
+    }
+}
+
+test "parse pong operation" {
+    const pongs = [_][]const u8{
+        "PONG\r\n",
+        "pong\n",
+        "pong     \n",
+    };
+    for (pongs) |buf| {
+        var op = try test_parse_line(buf);
+        try expect(op == .pong);
+    }
+}
+
 test "decode server info operation JSON args into ServerInfo struct" {
     const buf =
         \\{"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
@@ -378,14 +474,14 @@ const test_info_ops =
     \\INFO foo
     \\INFO foo bar
     \\
-    ;
+;
 
 // assert parsed operations based test_info_ops
 var assert_info_ops = struct {
     no: usize = 0,
     const Self = @This();
 
-    fn on_op(self: *Self, op: Op) !void {
+    fn on_op(self: *Self, op: Op) OpHandlerError!void {
         switch (self.no) {
             0 => {
                 try expectEqual(op.info.args[0], '{');
@@ -404,13 +500,12 @@ var assert_info_ops = struct {
     }
 }{};
 
-
 test "operation reader with buffer overflow for different buffer sizes" {
     var handler = struct {
         no: usize = 1,
         const Self = @This();
 
-        fn on_op(self: *Self, op: Op) !void {
+        fn on_op(self: *Self, op: Op) OpHandlerError!void {
             try expectEqual(self.no, op.info.args.len);
             self.no += 1;
         }
@@ -449,7 +544,7 @@ fn test_parse_line(buf: []const u8) !Op {
     var handler = struct {
         last_op: Op = undefined,
         const Self = @This();
-        fn on_op(self: *Self, op: Op) !void {
+        fn on_op(self: *Self, op: Op) OpHandlerError!void {
             self.last_op = op;
         }
     }{};
