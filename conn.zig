@@ -27,40 +27,53 @@ pub fn main() !void {
     }
 }
 
-// operation names
+// protocol operations
+// ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#protocol-messages
 const OpName = enum {
+    // sent by server
     info,
+    msg,
+    ok,
+    err,
+    // sent by client
     connect,
     pub_op, // pub is reserved word
     sub,
     unsub,
-    msg,
+    // sent by both client and server
     ping,
     pong,
+    // unsupported
     hmsg,
-    ok,
-    err,
 };
 
 const Op = union(OpName) {
     info: struct { args: []const u8 },
+    msg: struct { args: MsgArgs, payload: []const u8 },
+    ok,
+    err: struct { args: []const u8 },
+
     connect,
     pub_op,
     sub,
     unsub,
-    msg: struct { args: []const u8, payload: []const u8 },
+
     ping,
     pong,
+
     hmsg,
-    ok,
-    err: struct { args: []const u8 },
 };
 
+// TODO: rethink this
 const OpParseError = error{
     UnexpectedToken,
     MissingArguments,
     OutOfMemory,
     UnexpectedMsgArgs,
+
+    // parseInt
+    Overflow,
+    InvalidCharacter,
 
     TestUnexpectedResult,
     TestExpectedEqual,
@@ -97,6 +110,7 @@ const ParserState = enum {
     msg,
     msg_,
     msg_args,
+    msg_payload,
 };
 
 // reads operations from the underlying reader in chunks
@@ -112,6 +126,9 @@ pub fn OpReader(
         state: ParserState = .start,
         alloc: Allocator,
         args_buf: ?std.ArrayList(u8) = null,
+        payload_buf: ?std.ArrayList(u8) = null,
+        payload_size: usize = 0,
+        msg_args: ?MsgArgs = null,
 
         //const Error = ReaderType.ReadError || ParserError ;
         const Self = @This();
@@ -132,7 +149,9 @@ pub fn OpReader(
             var args_start: usize = 0;
             var drop: usize = 0;
 
-            for (buf) |b, i| {
+            var i: usize = 0;
+            while (i < buf.len) : (i += 1) {
+                var b = buf[i];
                 switch (self.state) {
                     .start => {
                         args_start = 0;
@@ -145,7 +164,11 @@ pub fn OpReader(
                             'P', 'p' => self.state = .p,
                             'M', 'm' => self.state = .m,
                             '-' => self.state = .minus,
-                            else => return OpParseError.UnexpectedToken,
+                            else => {
+                                //print("\nunexpected token '{s}' {d} {c}\n", .{buf, i, b});
+                                return OpParseError.UnexpectedToken;
+                            },
+
                         }
                     },
                     .p => {
@@ -327,17 +350,35 @@ pub fn OpReader(
                                 drop = 1;
                             },
                             '\n' => {
-                                //try self.on_err(buf[args_start .. i - drop]);
-                                self.state = .start;
+                                var ma = try parse_msg_args(self.alloc, try self.get_args(buf[args_start .. i - drop]));
+                                self.msg_args = ma;
+                                self.state = .msg_payload;
+                                self.payload_size = ma.size;
                             },
                             else => {},
+                        }
+                    },
+                    .msg_payload => {
+                        if (buf.len >= i + self.payload_size) {
+                            var payload = try self.get_payload(buf[i .. i + self.payload_size]);
+                            try self.handler.on_op(Op{ .msg = .{
+                                .args = self.msg_args.?,
+                                .payload = payload,
+                            } });
+                            i += self.payload_size-1;
+                            self.state = .start;
+                        } else {
+                            var pbuf = buf[i..];
+                            try self.push_payload(pbuf);
+                            self.payload_size -= pbuf.len;
+                            return;
                         }
                     },
                 }
             }
 
             // check for split buffer scenarios
-            if (self.state == .info_args) {
+            if (self.state == .info_args or self.state == .err_args or self.state == .msg_args) {
                 try self.push_args(buf[args_start .. buf.len - drop]);
             }
         }
@@ -368,10 +409,32 @@ pub fn OpReader(
             self.args_buf = ab;
         }
 
+        fn push_payload(self: *Self, buf: []const u8) !void {
+            if (self.payload_buf) |*ab| {
+                try ab.appendSlice(buf);
+                return;
+            }
+            var ab = std.ArrayList(u8).init(self.alloc);
+            try ab.appendSlice(buf);
+            self.payload_buf = ab;
+        }
+
+        fn get_payload(self: *Self, buf: []const u8) ![]const u8 {
+            if (self.payload_buf) |*ab| {
+                try ab.appendSlice(buf);
+                return ab.items;
+            }
+            return buf;
+        }
+
         fn deinit_args(self: *Self) void {
             if (self.args_buf) |*ab| {
                 ab.deinit();
                 self.args_buf = null;
+            }
+            if (self.payload_buf) |*ab| {
+                ab.deinit();
+                self.payload_buf = null;
             }
         }
 
@@ -381,7 +444,7 @@ pub fn OpReader(
     };
 }
 // reference implementation: https://github.com/nats-io/nats.go/blob/8af932f2076b3cab1a9a2f5aa2d9b59de2f1db6b/parser.go#L434
-fn parse_msg_args(buf: []const u8) !MsgArgs {
+fn parse_msg_args(alloc: Allocator, buf: []const u8) !MsgArgs {
     var parts: [4][]const u8 = .{empty_str} ** 4;
     var part_no: usize = 0;
 
@@ -415,23 +478,39 @@ fn parse_msg_args(buf: []const u8) !MsgArgs {
         part_no += 1;
     }
 
+    //print("\nparts:{s}\n", .{parts});
+
     if (part_no == 3) {
+        var sid = try std.fmt.parseUnsigned(u64, parts[1], 10);
+        var size = try std.fmt.parseUnsigned(u64, parts[2], 10);
         return MsgArgs{
-            .subject = parts[0],
-            .sid = try std.fmt.parseUnsigned(u64, parts[1], 10),
+            .subject = try cp(alloc, parts[0]),
+            .sid = sid,
             .reply = null,
-            .size = try std.fmt.parseUnsigned(u64, parts[2], 10),
+            .size = size,
+            .alloc = alloc,
         };
     }
     if (part_no == 4) {
+        var sid = try std.fmt.parseUnsigned(u64, parts[1], 10);
+        var size = try std.fmt.parseUnsigned(u64, parts[3], 10);
+        var subject = try cp(alloc, parts[0]);
+        errdefer alloc.free(subject);
         return MsgArgs{
-            .subject = parts[0],
-            .sid = try std.fmt.parseUnsigned(u64, parts[1], 10),
-            .reply = parts[2],
-            .size = try std.fmt.parseUnsigned(u64, parts[3], 10),
+            .subject = subject,
+            .sid = sid,
+            .reply = try cp(alloc, parts[2]),
+            .size = size,
+            .alloc = alloc,
         };
     }
     return OpParseError.UnexpectedMsgArgs;
+}
+
+fn cp(alloc: Allocator, src: []const u8) ![]u8 {
+    const dest = try alloc.alloc(u8, src.len);
+    mem.copy(u8, dest, src);
+    return dest;
 }
 
 const MsgArgs = struct {
@@ -439,6 +518,16 @@ const MsgArgs = struct {
     sid: u64,
     reply: ?[]const u8,
     size: u64,
+    alloc: Allocator,
+
+    const Self = @This();
+
+    fn deinit(self: Self) void {
+        self.alloc.free(self.subject);
+        if (self.reply != null) {
+            self.alloc.free(self.reply.?);
+        }
+    }
 };
 
 pub fn opReader(
@@ -738,30 +827,33 @@ fn test_parse_line(buf: []const u8) !Op {
 }
 
 test "parse msg args" {
-    var ma = try parse_msg_args("foo.bar 9 11");
+    var ma = try parse_msg_args(testing.allocator, "foo.bar 9 11");
     try expect(mem.eql(u8, ma.subject, "foo.bar"));
     try expect(ma.reply == null);
     try expectEqual(ma.sid, 9);
     try expectEqual(ma.size, 11);
+    ma.deinit();
 
-    ma = try parse_msg_args("bar.foo 10 INBOX.34 12");
+    ma = try parse_msg_args(testing.allocator, "bar.foo 10 INBOX.34 12");
     try expect(mem.eql(u8, ma.subject, "bar.foo"));
     try expect(mem.eql(u8, ma.reply.?, "INBOX.34"));
     try expectEqual(ma.sid, 10);
     try expectEqual(ma.size, 12);
+    ma.deinit();
 
-    ma = try parse_msg_args("bar.foo.bar    11\tINBOX.35           13 ");
+    ma = try parse_msg_args(testing.allocator, "bar.foo.bar    11\tINBOX.35           13 ");
     try expect(mem.eql(u8, ma.subject, "bar.foo.bar"));
     try expect(mem.eql(u8, ma.reply.?, "INBOX.35"));
     try expectEqual(ma.sid, 11);
     try expectEqual(ma.size, 13);
+    ma.deinit();
 
     const cases = [_][]const u8{
         "bar.foo 10 INBOX.34 extra.arg 12", // too many arguments
         "bar.foo 12", // too few arguments
     };
     for (cases) |case| {
-        if (parse_msg_args(case)) {
+        if (parse_msg_args(testing.allocator, case)) {
             unreachable;
         } else |err| switch (err) {
             OpParseError.UnexpectedMsgArgs => {},
@@ -774,12 +866,47 @@ test "parse msg args" {
         "bar.foo sid_not_a_number, 11",
     };
     for (not_a_number_cases) |case| {
-        if (parse_msg_args(case)) {
+        if (parse_msg_args(testing.allocator, case)) {
             unreachable;
         } else |err| switch (err) {
             std.fmt.ParseIntError.InvalidCharacter => {},
             else => unreachable,
         }
     }
+}
 
+test "message operation reader" {
+    var handler = struct {
+        no: usize = 1,
+        const Self = @This();
+
+        fn on_op(self: *Self, op: Op) OpHandlerError!void {
+            //print("subject: '{s}'\n", .{op.msg.args.subject});
+            try expect(mem.eql(u8, "subject", op.msg.args.subject));
+            try expectEqual(self.no, op.msg.args.size);
+            try expectEqual(self.no, op.msg.payload.len);
+            self.no += 1;
+            op.msg.args.deinit();
+        }
+    }{};
+
+    var cases = std.ArrayList(u8).init(testing.allocator);
+    defer cases.deinit();
+
+    var i: usize = 1;
+    while (i < 1024) : (i += 1) {
+        try cases.appendSlice("MSG subject 123 ");
+        try std.fmt.format(cases.writer(), "{d}", .{i});
+        try cases.appendSlice("\r\n");
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            try cases.append('a');
+        }
+    }
+    //print("{s}", .{cases.items});
+
+    var stream = bufferStream(cases.items);
+    var br = tinyOpReader(testing.allocator, stream, &handler);
+    defer br.deinit();
+    try br.loop();
 }
