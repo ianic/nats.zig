@@ -70,6 +70,7 @@ const OpParseError = error{
     MissingArguments,
     OutOfMemory,
     UnexpectedMsgArgs,
+    ArgsTooLong,
 
     // parseInt
     Overflow,
@@ -113,6 +114,8 @@ const ParserState = enum {
     msg_payload,
 };
 
+const max_args_len = 4096;
+
 // reads operations from the underlying reader in chunks
 // calls handler for each parsed operation
 pub fn OpReader(
@@ -125,7 +128,8 @@ pub fn OpReader(
         handler: OpHandlerType,
         state: ParserState = .start,
         alloc: Allocator,
-        args_buf: ?std.ArrayList(u8) = null,
+        args_buf: [max_args_len]u8 = undefined,
+        args_buf_len: usize = 0,
         payload_buf: ?std.ArrayList(u8) = null,
         payload_size: usize = 0,
         msg_args: ?MsgArgs = null,
@@ -392,21 +396,21 @@ pub fn OpReader(
         }
 
         fn get_args(self: *Self, buf: []const u8) ![]const u8 {
-            if (self.args_buf) |*ab| {
-                try ab.appendSlice(buf);
-                return ab.items;
+            if (self.args_buf_len == 0) {
+                return buf;
             }
-            return buf;
+            try self.push_args(buf);
+            var acc = self.args_buf[0..self.args_buf_len];
+            self.args_buf_len = 0;
+            return acc;
         }
 
         fn push_args(self: *Self, buf: []const u8) !void {
-            if (self.args_buf) |*ab| {
-                try ab.appendSlice(buf);
-                return;
+            if (self.args_buf_len+buf.len > max_args_len) {
+                return OpParseError.ArgsTooLong;
             }
-            var ab = std.ArrayList(u8).init(self.alloc);
-            try ab.appendSlice(buf);
-            self.args_buf = ab;
+            mem.copy(u8, self.args_buf[self.args_buf_len..self.args_buf_len+buf.len], buf);
+            self.args_buf_len += buf.len;
         }
 
         fn push_payload(self: *Self, buf: []const u8) !void {
@@ -428,10 +432,6 @@ pub fn OpReader(
         }
 
         fn deinit_args(self: *Self) void {
-            if (self.args_buf) |*ab| {
-                ab.deinit();
-                self.args_buf = null;
-            }
             if (self.payload_buf) |*ab| {
                 ab.deinit();
                 self.payload_buf = null;
@@ -604,6 +604,7 @@ const ServerInfo = struct {
 const testing = std.testing;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
+const expectError = std.testing.expectError;
 const mem = std.mem;
 
 test "parser info operation" {
@@ -633,12 +634,8 @@ test "parser info operation" {
 
     const invalid = [_][]const u8{ "INFOO something\r\n", "INFO_ something\r\n", "INFOsomething\r\n", "-err\n" };
     for (invalid) |buf| {
-        if (test_parse_line(buf)) {
-            unreachable;
-        } else |err| switch (err) {
-            OpParseError.UnexpectedToken => {},
-            else => unreachable,
-        }
+        var err = test_parse_line(buf);
+        try expectError(OpParseError.UnexpectedToken, err);
     }
 
     const missing_arguments = [_][]const u8{
@@ -648,12 +645,8 @@ test "parser info operation" {
         "-err\t   \r",
     };
     for (missing_arguments) |buf| {
-        if (test_parse_line(buf)) {
-            unreachable;
-        } else |err| switch (err) {
-            OpParseError.MissingArguments => {},
-            else => unreachable,
-        }
+        var err = test_parse_line(buf);
+        try expectError(OpParseError.MissingArguments, err);
     }
 }
 
@@ -697,6 +690,24 @@ test "parse err operation" {
             else => {},
         }
     }
+}
+
+test "args line too long" {
+    var max_line = std.ArrayList(u8).init(testing.allocator);
+    defer max_line.deinit();
+    try max_line.appendSlice("INFO ");
+    try max_line.appendNTimes('a', max_args_len);
+    try max_line.appendSlice("\r\n");
+    var op = try test_parse_line(max_line.items);
+    try expect(op == .info);
+
+    var too_long = std.ArrayList(u8).init(testing.allocator);
+    defer too_long.deinit();
+    try too_long.appendSlice("INFO ");
+    try too_long.appendNTimes('a', max_args_len+1);
+    try too_long.appendSlice("\r\n");
+    var err = test_parse_line(too_long.items);
+    try expectError(OpParseError.ArgsTooLong, err);
 }
 
 test "decode server info operation JSON args into ServerInfo struct" {
@@ -853,12 +864,8 @@ test "parse msg args" {
         "bar.foo 12", // too few arguments
     };
     for (cases) |case| {
-        if (parse_msg_args(testing.allocator, case)) {
-            unreachable;
-        } else |err| switch (err) {
-            OpParseError.UnexpectedMsgArgs => {},
-            else => unreachable,
-        }
+        var err = parse_msg_args(testing.allocator, case);
+        try expectError(OpParseError.UnexpectedMsgArgs, err);
     }
 
     const not_a_number_cases = [_][]const u8{
@@ -866,12 +873,8 @@ test "parse msg args" {
         "bar.foo sid_not_a_number, 11",
     };
     for (not_a_number_cases) |case| {
-        if (parse_msg_args(testing.allocator, case)) {
-            unreachable;
-        } else |err| switch (err) {
-            std.fmt.ParseIntError.InvalidCharacter => {},
-            else => unreachable,
-        }
+        var err = parse_msg_args(testing.allocator, case);
+        try expectError(OpParseError.InvalidCharacter, err);
     }
 }
 
