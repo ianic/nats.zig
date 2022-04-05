@@ -53,7 +53,7 @@ const Op = union(OpName) {
     pong,
     hmsg,
     ok,
-    err,
+    err: struct { args: []const u8 },
 };
 
 const OpParseError = error{
@@ -85,6 +85,17 @@ const ParserState = enum {
     po,
     pon,
     pong,
+    minus,
+    e,
+    er,
+    err,
+    err_,
+    err_args,
+    m,
+    ms,
+    msg,
+    msg_,
+    msg_args,
 };
 
 // reads operations from the underlying reader in chunks
@@ -131,6 +142,8 @@ pub fn OpReader(
                             '\r', '\n' => {},
                             'I', 'i' => self.state = .i,
                             'P', 'p' => self.state = .p,
+                            'M', 'm' => self.state = .m,
+                            '-' => self.state = .minus,
                             else => return OpParseError.UnexpectedToken,
                         }
                     },
@@ -204,9 +217,7 @@ pub fn OpReader(
                     },
                     .info => {
                         switch (b) {
-                            ' ', '\t' => {
-                                self.state = .info_;
-                            },
+                            ' ', '\t' => self.state = .info_,
                             else => return OpParseError.UnexpectedToken,
                         }
                     },
@@ -233,6 +244,94 @@ pub fn OpReader(
                             else => {},
                         }
                     },
+                    .minus => {
+                        switch (b) {
+                            'E', 'e' => self.state = .e,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .e => {
+                        switch (b) {
+                            'R', 'r' => self.state = .er,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .er => {
+                        switch (b) {
+                            'R', 'r' => self.state = .err,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .err => {
+                        switch (b) {
+                            ' ', '\t' => {
+                                self.state = .err_;
+                            },
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .err_ => {
+                        switch (b) {
+                            ' ', '\t' => {},
+                            '\r', '\n' => return OpParseError.MissingArguments,
+                            else => {
+                                self.state = .err_args;
+                                args_start = i;
+                            },
+                        }
+                    },
+                    .err_args => {
+                        switch (b) {
+                            '\r' => {
+                                drop = 1;
+                            },
+                            '\n' => {
+                                try self.on_err(buf[args_start .. i - drop]);
+                                self.state = .start;
+                            },
+                            else => {},
+                        }
+                    },
+                    .m => {
+                        switch (b) {
+                            'S', 's' => self.state = .ms,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .ms => {
+                        switch (b) {
+                            'G', 'g' => self.state = .msg,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .msg => {
+                        switch (b) {
+                            ' ', '\t' => self.state = .msg_,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .msg_ => {
+                        switch (b) {
+                            ' ', '\t' => {},
+                            '\r', '\n' => return OpParseError.MissingArguments,
+                            else => {
+                                self.state = .msg_args;
+                                args_start = i;
+                            },
+                        }
+                    },
+                    .msg_args => {
+                        switch (b) {
+                            '\r' => {
+                                drop = 1;
+                            },
+                            '\n' => {
+                                //try self.on_err(buf[args_start .. i - drop]);
+                                self.state = .start;
+                            },
+                            else => {},
+                        }
+                    },
                 }
             }
 
@@ -243,15 +342,22 @@ pub fn OpReader(
         }
 
         fn on_info(self: *Self, buf: []const u8) OpParseError!void {
-            if (self.args_buf) |*ab| {
-                try ab.appendSlice(buf);
-                try self.handler.on_op(Op{ .info = .{ .args = ab.items } });
-                return;
-            }
-            try self.handler.on_op(Op{ .info = .{ .args = buf } });
+            try self.handler.on_op(Op{ .info = .{ .args = try self.get_args(buf) } });
         }
 
-        fn push_args(self: *Self, buf: []const u8) OpParseError!void {
+        fn on_err(self: *Self, buf: []const u8) OpParseError!void {
+            try self.handler.on_op(Op{ .err = .{ .args = try self.get_args(buf) } });
+        }
+
+        fn get_args(self: *Self, buf: []const u8) ![]const u8 {
+            if (self.args_buf) |*ab| {
+                try ab.appendSlice(buf);
+                return ab.items;
+            }
+            return buf;
+        }
+
+        fn push_args(self: *Self, buf: []const u8) !void {
             if (self.args_buf) |*ab| {
                 try ab.appendSlice(buf);
                 return;
@@ -375,11 +481,7 @@ test "parser info operation" {
         try expect(op.info.args.len == v.args_buf_len);
     }
 
-    const invalid = [_][]const u8{
-        "INFOO something\r\n",
-        "INFO_ something\r\n",
-        "INFOsomething\r\n",
-    };
+    const invalid = [_][]const u8{ "INFOO something\r\n", "INFO_ something\r\n", "INFOsomething\r\n", "-err\n" };
     for (invalid) |buf| {
         if (test_parse_line(buf)) {
             unreachable;
@@ -392,6 +494,8 @@ test "parser info operation" {
     const missing_arguments = [_][]const u8{
         "INFO \r\n",
         "INFO \n",
+        "-err \n",
+        "-err\t   \r",
     };
     for (missing_arguments) |buf| {
         if (test_parse_line(buf)) {
@@ -424,6 +528,24 @@ test "parse pong operation" {
     for (pongs) |buf| {
         var op = try test_parse_line(buf);
         try expect(op == .pong);
+    }
+}
+
+test "parse err operation" {
+    const errs = [_][]const u8{
+        "-ERR 'Stale Connection'\r\n",
+        "-err 'Unknown Protocol Operation'\n",
+        "-eRr\t'Permissions Violation for Subscription to foo.bar'\n",
+    };
+    for (errs) |buf, i| {
+        var op = try test_parse_line(buf);
+        try expect(op == .err);
+        switch (i) {
+            0 => try expect(mem.eql(u8, "'Stale Connection'", op.err.args)),
+            1 => try expect(mem.eql(u8, "'Unknown Protocol Operation'", op.err.args)),
+            2 => try expect(mem.eql(u8, "'Permissions Violation for Subscription to foo.bar'", op.err.args)),
+            else => {},
+        }
     }
 }
 
@@ -552,4 +674,7 @@ fn test_parse_line(buf: []const u8) !Op {
     var opr = opReader(testing.allocator, bufferStream(buf), &handler);
     try opr.loop();
     return handler.last_op;
+}
+
+test "parse msg args" {
 }
