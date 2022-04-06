@@ -49,7 +49,7 @@ const OpName = enum {
 
 const Op = union(OpName) {
     info: struct { args: []const u8 },
-    msg: struct { args: MsgArgs, payload: []const u8 },
+    msg: Msg,
     ok,
     err: struct { args: []const u8 },
 
@@ -132,7 +132,7 @@ pub fn OpReader(
         args_buf_len: usize = 0,
         payload_buf: ?std.ArrayList(u8) = null,
         payload_size: usize = 0,
-        msg_args: ?MsgArgs = null,
+        msg: ?Msg = null,
 
         //const Error = ReaderType.ReadError || ParserError ;
         const Self = @This();
@@ -172,7 +172,6 @@ pub fn OpReader(
                                 //print("\nunexpected token '{s}' {d} {c}\n", .{buf, i, b});
                                 return OpParseError.UnexpectedToken;
                             },
-
                         }
                     },
                     .p => {
@@ -354,24 +353,22 @@ pub fn OpReader(
                                 drop = 1;
                             },
                             '\n' => {
-                                var ma = try parse_msg_args(self.alloc, try self.get_args(buf[args_start .. i - drop]));
-                                self.msg_args = ma;
+                                var msg = try parse_msg_args(self.alloc, try self.get_args(buf[args_start .. i - drop]));
+                                self.msg = msg;
                                 self.state = .msg_payload;
-                                self.payload_size = ma.size;
+                                self.payload_size = msg.size;
                             },
                             else => {},
                         }
                     },
                     .msg_payload => {
                         if (buf.len >= i + self.payload_size) {
-                            var payload = try self.get_payload(buf[i .. i + self.payload_size]);
-                            try self.handler.on_op(Op{ .msg = .{
-                                .args = self.msg_args.?,
-                                .payload = payload,
-                            } });
-                            i += self.payload_size-1;
+                            try self.on_msg(buf[i .. i + self.payload_size]);
+                            i += self.payload_size - 1;
+                            self.payload_size = 0;
                             self.state = .start;
                         } else {
+                            // split buffer, save what we have so far
                             var pbuf = buf[i..];
                             try self.push_payload(pbuf);
                             self.payload_size -= pbuf.len;
@@ -385,6 +382,13 @@ pub fn OpReader(
             if (self.state == .info_args or self.state == .err_args or self.state == .msg_args) {
                 try self.push_args(buf[args_start .. buf.len - drop]);
             }
+        }
+
+        fn on_msg(self: *Self, buf: []const u8) !void {
+            var payload = try self.get_payload(buf);
+            var msg = self.msg.?;
+            msg.payload = try cp(self.alloc, payload);
+            try self.handler.on_op(Op{ .msg = msg });
         }
 
         fn on_info(self: *Self, buf: []const u8) OpParseError!void {
@@ -406,10 +410,10 @@ pub fn OpReader(
         }
 
         fn push_args(self: *Self, buf: []const u8) !void {
-            if (self.args_buf_len+buf.len > max_args_len) {
+            if (self.args_buf_len + buf.len > max_args_len) {
                 return OpParseError.ArgsTooLong;
             }
-            mem.copy(u8, self.args_buf[self.args_buf_len..self.args_buf_len+buf.len], buf);
+            mem.copy(u8, self.args_buf[self.args_buf_len .. self.args_buf_len + buf.len], buf);
             self.args_buf_len += buf.len;
         }
 
@@ -444,7 +448,7 @@ pub fn OpReader(
     };
 }
 // reference implementation: https://github.com/nats-io/nats.go/blob/8af932f2076b3cab1a9a2f5aa2d9b59de2f1db6b/parser.go#L434
-fn parse_msg_args(alloc: Allocator, buf: []const u8) !MsgArgs {
+fn parse_msg_args(alloc: Allocator, buf: []const u8) !Msg {
     var parts: [4][]const u8 = .{empty_str} ** 4;
     var part_no: usize = 0;
 
@@ -483,7 +487,7 @@ fn parse_msg_args(alloc: Allocator, buf: []const u8) !MsgArgs {
     if (part_no == 3) {
         var sid = try std.fmt.parseUnsigned(u64, parts[1], 10);
         var size = try std.fmt.parseUnsigned(u64, parts[2], 10);
-        return MsgArgs{
+        return Msg{
             .subject = try cp(alloc, parts[0]),
             .sid = sid,
             .reply = null,
@@ -496,7 +500,7 @@ fn parse_msg_args(alloc: Allocator, buf: []const u8) !MsgArgs {
         var size = try std.fmt.parseUnsigned(u64, parts[3], 10);
         var subject = try cp(alloc, parts[0]);
         errdefer alloc.free(subject);
-        return MsgArgs{
+        return Msg{
             .subject = subject,
             .sid = sid,
             .reply = try cp(alloc, parts[2]),
@@ -513,11 +517,12 @@ fn cp(alloc: Allocator, src: []const u8) ![]u8 {
     return dest;
 }
 
-const MsgArgs = struct {
+const Msg = struct {
     subject: []const u8,
     sid: u64,
     reply: ?[]const u8,
     size: u64,
+    payload: ?[]const u8 = null,
     alloc: Allocator,
 
     const Self = @This();
@@ -526,6 +531,9 @@ const MsgArgs = struct {
         self.alloc.free(self.subject);
         if (self.reply != null) {
             self.alloc.free(self.reply.?);
+        }
+        if (self.payload != null) {
+            self.alloc.free(self.payload.?);
         }
     }
 };
@@ -704,7 +712,7 @@ test "args line too long" {
     var too_long = std.ArrayList(u8).init(testing.allocator);
     defer too_long.deinit();
     try too_long.appendSlice("INFO ");
-    try too_long.appendNTimes('a', max_args_len+1);
+    try too_long.appendNTimes('a', max_args_len + 1);
     try too_long.appendSlice("\r\n");
     var err = test_parse_line(too_long.items);
     try expectError(OpParseError.ArgsTooLong, err);
@@ -885,11 +893,11 @@ test "message operation reader" {
 
         fn on_op(self: *Self, op: Op) OpHandlerError!void {
             //print("subject: '{s}'\n", .{op.msg.args.subject});
-            try expect(mem.eql(u8, "subject", op.msg.args.subject));
-            try expectEqual(self.no, op.msg.args.size);
-            try expectEqual(self.no, op.msg.payload.len);
+            try expect(mem.eql(u8, "subject", op.msg.subject));
+            try expectEqual(self.no, op.msg.size);
+            try expectEqual(self.no, op.msg.payload.?.len);
             self.no += 1;
-            op.msg.args.deinit();
+            op.msg.deinit();
         }
     }{};
 
