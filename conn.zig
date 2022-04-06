@@ -103,6 +103,7 @@ const ParserState = enum {
 };
 
 const max_args_len = 4096;
+var scratch: [max_args_len]u8 = undefined;
 
 // reads operations from the underlying reader in chunks
 // calls handler for each parsed operation
@@ -116,23 +117,28 @@ pub fn OpReader(
         handler: OpHandlerType,
         alloc: Allocator,
         state: ParserState = .start,
-        args_buf: [max_args_len]u8 = undefined,
+
+        args_buf: []u8 = scratch[0..],
         args_buf_len: usize = 0,
-        payload_buf: ?std.ArrayList(u8) = null,
+
+        payload_buf: []u8 = scratch[0..],
+        payload_buf_len: usize = 0,
+        payload_buf_owned: bool = false,
+
         payload_size: usize = 0,
         msg: ?Msg = null,
 
         const Self = @This();
 
         pub fn loop(self: *Self) !void {
-            var scratch: [buffer_size]u8 = undefined;
+            var buf: [buffer_size]u8 = undefined;
 
             while (true) {
-                var bytes_read = try self.parent.read(scratch[0..]);
+                var bytes_read = try self.parent.read(buf[0..]);
                 if (bytes_read == 0) {
                     return;
                 }
-                try self.parse(scratch[0..bytes_read]);
+                try self.parse(buf[0..bytes_read]);
             }
         }
 
@@ -404,25 +410,37 @@ pub fn OpReader(
         }
 
         fn push_payload(self: *Self, buf: []const u8) !void {
-            if (self.payload_buf) |*pb| {
-                try pb.appendSlice(buf);
-                return;
+            var new_len = self.payload_buf_len + buf.len;
+            if (new_len > self.payload_buf.len) {
+                const dest = try self.alloc.alloc(u8, new_len);
+                mem.copy(u8, dest, self.payload_buf);
+                if (self.payload_buf_owned) {
+                    self.alloc.free(self.payload_buf);
+                }
+                self.payload_buf = dest;
+                self.payload_buf_owned = true;
             }
-            var pb = std.ArrayList(u8).init(self.alloc);
-            try pb.appendSlice(buf);
-            self.payload_buf = pb;
+            mem.copy(u8, self.payload_buf[self.payload_buf_len..new_len], buf);
+            self.payload_buf_len = new_len;
         }
 
         fn get_payload(self: *Self, buf: []const u8) ![]const u8 {
-            if (self.payload_buf) |*pb| {
-                try pb.appendSlice(buf);
-                var ret = pb.toOwnedSlice();
-                self.payload_buf = null;
-                return ret;
+            if (self.payload_buf_len > 0) {
+                try self.push_payload(buf);
+                defer self.reset_payload_buf();
+                if (self.payload_buf_owned) {
+                    return self.payload_buf[0..self.payload_buf_len];
+                }
+                return try cp(self.alloc, self.payload_buf[0..self.payload_buf_len]);
             }
             return try cp(self.alloc, buf);
         }
 
+        fn reset_payload_buf(self: *Self) void {
+            self.payload_buf = scratch[0..];
+            self.payload_buf_len = 0;
+            self.payload_buf_owned = false;
+        }
     };
 }
 // reference implementation: https://github.com/nats-io/nats.go/blob/8af932f2076b3cab1a9a2f5aa2d9b59de2f1db6b/parser.go#L434
@@ -867,7 +885,7 @@ test "message operation reader" {
         const Self = @This();
 
         fn on_op(self: *Self, op: Op) !void {
-            //print("subject: '{s}'\n", .{op.msg.args.subject});
+            //print("no: {d}, len: {d}\n", .{self.no, op.msg.payload.?.len});
             try expect(mem.eql(u8, "subject", op.msg.subject));
             try expectEqual(self.no, op.msg.size);
             try expectEqual(self.no, op.msg.payload.?.len);
