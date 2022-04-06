@@ -49,7 +49,7 @@ const OpName = enum {
 };
 
 const Op = union(OpName) {
-    info: struct { args: []const u8 },
+    info: Info,
     msg: Msg,
     ok,
     err: struct { args: []const u8 },
@@ -63,12 +63,19 @@ const Op = union(OpName) {
     pong,
 
     hmsg,
+
+    fn deinit(op: Op) void {
+        switch (op) {
+            .info => op.info.deinit(),
+            .msg => op.msg.deinit(),
+            else => {},
+        }
+    }
 };
 
 const OpParseError = error{
     UnexpectedToken,
     MissingArguments,
-    OutOfMemory,
     UnexpectedMsgArgs,
     ArgsTooLong,
 };
@@ -100,6 +107,9 @@ const ParserState = enum {
     msg_,
     msg_args,
     msg_payload,
+    plus,
+    o,
+    ok,
 };
 
 const max_args_len = 4096;
@@ -160,6 +170,7 @@ pub fn OpReader(
                             'P', 'p' => self.state = .p,
                             'M', 'm' => self.state = .m,
                             '-' => self.state = .minus,
+                            '+' => self.state = .plus,
                             else => {
                                 //print("\nunexpected token '{s}' {d} {c}\n", .{buf, i, b});
                                 return OpParseError.UnexpectedToken;
@@ -311,6 +322,27 @@ pub fn OpReader(
                             else => {},
                         }
                     },
+                    .plus => {
+                        switch (b) {
+                            'O', 'o' => self.state = .err,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .o => {
+                        switch (b) {
+                            'K', 'k' => self.state = .err,
+                            else => return OpParseError.UnexpectedToken,
+                        }
+                    },
+                    .ok => {
+                        switch (b) {
+                            '\n' => {
+                                try self.handler.on_op(Op.ok);
+                                self.state = .start;
+                            },
+                            else => {},
+                        }
+                    },
                     .m => {
                         switch (b) {
                             'S', 's' => self.state = .ms,
@@ -384,7 +416,9 @@ pub fn OpReader(
         }
 
         fn on_info(self: *Self, buf: []const u8) !void {
-            try self.handler.on_op(Op{ .info = .{ .args = try self.get_args(buf) } });
+            var args = try self.get_args(buf);
+            var info = try Info.json_parse(self.alloc, args);
+            try self.handler.on_op(Op{ .info = info});
         }
 
         fn on_err(self: *Self, buf: []const u8) !void {
@@ -561,46 +595,56 @@ pub fn tinyOpReader(
 // TODO check this empty string idea, trying to avoid undefined
 const empty_str = ([_]u8{})[0..];
 
-const ServerInfo = struct {
-    // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#info
-    // https://github.com/nats-io/nats.go/blob/e076b0dcab3193b8d7cf41c1b747355ad1302170/nats.go#L687
-    server_id: []u8 = empty_str,
-    server_name: []u8 = empty_str,
-    proto: u32 = 1,
-    version: []u8 = empty_str,
-    host: []u8 = empty_str,
-    port: u32 = 4222,
+const Info = struct {
+    const Args = struct {
+        // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#info
+        // https://github.com/nats-io/nats.go/blob/e076b0dcab3193b8d7cf41c1b747355ad1302170/nats.go#L687
+        server_id: []u8 = empty_str,
+        server_name: []u8 = empty_str,
+        proto: u32 = 1,
+        version: []u8 = empty_str,
+        host: []u8 = empty_str,
+        port: u32 = 4222,
 
-    headers: bool = false,
-    auth_required: bool = false,
-    tls_required: bool = false,
-    tls_available: bool = false,
+        headers: bool = false,
+        auth_required: bool = false,
+        tls_required: bool = false,
+        tls_available: bool = false,
 
-    max_payload: u64 = 1048576,
-    client_id: u64 = 0,
-    client_ip: []u8 = empty_str,
+        max_payload: u64 = 1048576,
+        client_id: u64 = 0,
+        client_ip: []u8 = empty_str,
 
-    nonce: []u8 = ([_]u8{})[0..],
-    cluster: []u8 = empty_str,
-    connect_urls: [][]u8 = ([_][]u8{})[0..],
+        nonce: []u8 = empty_str,
+        cluster: []u8 = empty_str,
+        connect_urls: [][]u8 = ([_][]u8{})[0..],
 
-    ldm: bool = false,
-    jetstream: bool = false,
+        ldm: bool = false,
+        jetstream: bool = false,
+    };
 
-    pub fn decode(alloc: Allocator, buf: []const u8) std.json.ParseError(ServerInfo)!ServerInfo {
+    args: Args,
+    alloc: Allocator,
+
+    fn json_parse(alloc: Allocator, buf: []const u8) !Info {
         // fixing error: evaluation exceeded 1000 backwards branches
         // ref: https://github.com/ziglang/zig/issues/9728
         @setEvalBranchQuota(1024 * 8);
         var stream = std.json.TokenStream.init(buf);
-        return try std.json.parse(ServerInfo, &stream, .{
+        var args = try std.json.parse(Args, &stream, .{
             .allocator = alloc,
             .ignore_unknown_fields = true,
+            //.allow_trailing_data = true,
         });
+        return Info{
+            .alloc = alloc,
+            .args = args,
+        };
     }
 
-    pub fn deinit(self: ServerInfo, alloc: Allocator) void {
-        std.json.parseFree(ServerInfo, self, .{
-            .allocator = alloc,
+    fn deinit(self: Info) void {
+        std.json.parseFree(Args, self.args, .{
+            .allocator = self.alloc,
         });
     }
 };
@@ -618,22 +662,22 @@ test "parser info operation" {
     };
     const valid = [_]Case{
         Case{
-            .buf = "INFO 0123456789\r\n",
+            .buf = "INFO {\"proto\":0}\r\n",
             .args_buf_len = 10,
         },
         Case{
-            .buf = "info 01234567890\n",
+            .buf = "info {\"proto\":1}\n",
             .args_buf_len = 11,
         },
         Case{
-            .buf = "iNfO 012345678901\r\n",
+            .buf = "iNfO {\"proto\":2}\r\n",
             .args_buf_len = 12,
         },
     };
 
-    for (valid) |v| {
+    for (valid) |v, i| {
         var op = try test_parse_line(v.buf);
-        try expect(op.info.args.len == v.args_buf_len);
+        try expect(op.info.args.proto == i);
     }
 
     const invalid = [_][]const u8{ "INFOO something\r\n", "INFO_ something\r\n", "INFOsomething\r\n", "-err\n" };
@@ -699,15 +743,15 @@ test "parse err operation" {
 test "args line too long" {
     var max_line = std.ArrayList(u8).init(testing.allocator);
     defer max_line.deinit();
-    try max_line.appendSlice("INFO ");
+    try max_line.appendSlice("-ERR ");
     try max_line.appendNTimes('a', max_args_len);
     try max_line.appendSlice("\r\n");
     var op = try test_parse_line(max_line.items);
-    try expect(op == .info);
+    try expect(op == .err);
 
     var too_long = std.ArrayList(u8).init(testing.allocator);
     defer too_long.deinit();
-    try too_long.appendSlice("INFO ");
+    try too_long.appendSlice("-ERR ");
     try too_long.appendNTimes('a', max_args_len + 1);
     try too_long.appendSlice("\r\n");
     var err = test_parse_line(too_long.items);
@@ -720,25 +764,29 @@ test "decode server info operation JSON args into ServerInfo struct" {
     ;
 
     var alloc = std.testing.allocator;
-    var im = try ServerInfo.decode(alloc, buf);
-    defer im.deinit(alloc);
+    var si = try Info.json_parse(alloc, buf);
+    defer si.deinit();
 
-    try expect(mem.eql(u8, "id", im.server_id));
-    try expect(mem.eql(u8, "name", im.server_name));
-    try expect(mem.eql(u8, "2.8.0", im.version));
-    try expect(mem.eql(u8, "127.0.0.1", im.client_ip));
-    try expect(mem.eql(u8, empty_str, im.nonce));
-    try expectEqual(im.port, 4222);
-    try expectEqual(im.proto, 1);
-    try expectEqual(im.max_payload, 123456);
-    try expectEqual(im.client_id, 53);
-    try expect(im.headers);
-    try expect(im.jetstream);
+    try assert_info_args(si.args);
+}
 
-    try expectEqual(im.connect_urls.len, 3);
-    try expect(mem.eql(u8, im.connect_urls[0], "10.0.0.184:4333"));
-    try expect(mem.eql(u8, im.connect_urls[1], "192.168.129.1:4333"));
-    try expect(mem.eql(u8, im.connect_urls[2], "192.168.192.1:4333"));
+fn assert_info_args(args: Info.Args) !void {
+    try expect(mem.eql(u8, "id", args.server_id));
+    try expect(mem.eql(u8, "name", args.server_name));
+    try expect(mem.eql(u8, "2.8.0", args.version));
+    try expect(mem.eql(u8, "127.0.0.1", args.client_ip));
+    try expect(mem.eql(u8, empty_str, args.nonce));
+    try expectEqual(args.port, 4222);
+    try expectEqual(args.proto, 1);
+    try expectEqual(args.max_payload, 123456);
+    try expectEqual(args.client_id, 53);
+    try expect(args.headers);
+    try expect(args.jetstream);
+
+    try expectEqual(args.connect_urls.len, 3);
+    try expect(mem.eql(u8, args.connect_urls[0], "10.0.0.184:4333"));
+    try expect(mem.eql(u8, args.connect_urls[1], "192.168.129.1:4333"));
+    try expect(mem.eql(u8, args.connect_urls[2], "192.168.192.1:4333"));
 }
 
 test "operation reader" {
@@ -756,8 +804,8 @@ test "operation reader with buffer overflow" {
 // define info operations for use in test
 const test_info_ops =
     \\INFO {"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
-    \\INFO foo
-    \\INFO foo bar
+    \\INFO {"server_id":"2"}
+    \\INFO {"server_id":"3"}
     \\
 ;
 
@@ -769,19 +817,18 @@ var assert_info_ops = struct {
     fn on_op(self: *Self, op: Op) !void {
         switch (self.no) {
             0 => {
-                try expectEqual(op.info.args[0], '{');
-                try expectEqual(op.info.args[278], '}');
-                try expectEqual(op.info.args.len, 279);
+                try assert_info_args(op.info.args);
             },
             1 => {
-                try expect(mem.eql(u8, op.info.args, "foo"));
+                try expect(mem.eql(u8, op.info.args.server_id, "2"));
             },
             2 => {
-                try expect(mem.eql(u8, op.info.args, "foo bar"));
+                try expect(mem.eql(u8, op.info.args.server_id, "3"));
             },
             else => {},
         }
         self.no += 1;
+        op.deinit();
     }
 }{};
 
@@ -791,8 +838,9 @@ test "operation reader with buffer overflow for different buffer sizes" {
         const Self = @This();
 
         fn on_op(self: *Self, op: Op) !void {
-            try expectEqual(self.no, op.info.args.len);
+            try expectEqual(self.no, op.info.args.server_id.len);
             self.no += 1;
+            op.deinit();
         }
     }{};
 
@@ -801,20 +849,17 @@ test "operation reader with buffer overflow for different buffer sizes" {
 
     var i: usize = 1;
     while (i < 1024) : (i += 1) {
-        try cases.appendSlice("INFO ");
+        try cases.appendSlice("INFO {\"server_id\":\"");
         var j: usize = 0;
         while (j < i) : (j += 1) {
             try cases.append('a');
         }
-        try cases.appendSlice("\r\n");
-    }
-    while (i < 2048) : (i += 1) {
-        try cases.appendSlice("INFO ");
-        var j: usize = 0;
-        while (j < i) : (j += 1) {
-            try cases.append('a');
+        try cases.appendSlice("\"}");
+        if (i%2 == 0) { // use both line ending \r\n and just \n
+            try cases.appendSlice("\r\n");
+        } else {
+            try cases.appendSlice("\n");
         }
-        try cases.appendSlice("\n");
     }
 
     var stream = bufferStream(cases.items);
@@ -890,7 +935,7 @@ test "message operation reader" {
             try expectEqual(self.no, op.msg.size);
             try expectEqual(self.no, op.msg.payload.?.len);
             self.no += 1;
-            op.msg.deinit();
+            op.deinit();
         }
     }{};
 
