@@ -1,6 +1,7 @@
 const std = @import("std");
 const print = std.debug.print;
 const net = std.net;
+const fmt = std.fmt;
 const Allocator = std.mem.Allocator;
 const bufferStream = std.io.fixedBufferStream;
 
@@ -64,25 +65,12 @@ const Op = union(OpName) {
     hmsg,
 };
 
-// TODO: rethink this
 const OpParseError = error{
     UnexpectedToken,
     MissingArguments,
     OutOfMemory,
     UnexpectedMsgArgs,
     ArgsTooLong,
-
-    // parseInt
-    Overflow,
-    InvalidCharacter,
-
-    TestUnexpectedResult,
-    TestExpectedEqual,
-};
-
-const OpHandlerError = error{
-    TestUnexpectedResult,
-    TestExpectedEqual,
 };
 
 const ParserState = enum {
@@ -126,18 +114,17 @@ pub fn OpReader(
     return struct {
         parent: ReaderType,
         handler: OpHandlerType,
-        state: ParserState = .start,
         alloc: Allocator,
+        state: ParserState = .start,
         args_buf: [max_args_len]u8 = undefined,
         args_buf_len: usize = 0,
         payload_buf: ?std.ArrayList(u8) = null,
         payload_size: usize = 0,
         msg: ?Msg = null,
 
-        //const Error = ReaderType.ReadError || ParserError ;
         const Self = @This();
 
-        pub fn loop(self: *Self) OpParseError!void {
+        pub fn loop(self: *Self) !void {
             var scratch: [buffer_size]u8 = undefined;
 
             while (true) {
@@ -149,7 +136,7 @@ pub fn OpReader(
             }
         }
 
-        fn parse(self: *Self, buf: []const u8) OpParseError!void {
+        fn parse(self: *Self, buf: []const u8) !void {
             var args_start: usize = 0;
             var drop: usize = 0;
 
@@ -160,7 +147,6 @@ pub fn OpReader(
                     .start => {
                         args_start = 0;
                         drop = 0;
-                        self.deinit_args();
 
                         switch (b) {
                             '\r', '\n' => {},
@@ -385,17 +371,17 @@ pub fn OpReader(
         }
 
         fn on_msg(self: *Self, buf: []const u8) !void {
-            var payload = try self.get_payload(buf);
             var msg = self.msg.?;
-            msg.payload = try cp(self.alloc, payload);
+            msg.payload = try self.get_payload(buf);
             try self.handler.on_op(Op{ .msg = msg });
+            self.msg = null;
         }
 
-        fn on_info(self: *Self, buf: []const u8) OpParseError!void {
+        fn on_info(self: *Self, buf: []const u8) !void {
             try self.handler.on_op(Op{ .info = .{ .args = try self.get_args(buf) } });
         }
 
-        fn on_err(self: *Self, buf: []const u8) OpParseError!void {
+        fn on_err(self: *Self, buf: []const u8) !void {
             try self.handler.on_op(Op{ .err = .{ .args = try self.get_args(buf) } });
         }
 
@@ -418,33 +404,25 @@ pub fn OpReader(
         }
 
         fn push_payload(self: *Self, buf: []const u8) !void {
-            if (self.payload_buf) |*ab| {
-                try ab.appendSlice(buf);
+            if (self.payload_buf) |*pb| {
+                try pb.appendSlice(buf);
                 return;
             }
-            var ab = std.ArrayList(u8).init(self.alloc);
-            try ab.appendSlice(buf);
-            self.payload_buf = ab;
+            var pb = std.ArrayList(u8).init(self.alloc);
+            try pb.appendSlice(buf);
+            self.payload_buf = pb;
         }
 
         fn get_payload(self: *Self, buf: []const u8) ![]const u8 {
-            if (self.payload_buf) |*ab| {
-                try ab.appendSlice(buf);
-                return ab.items;
-            }
-            return buf;
-        }
-
-        fn deinit_args(self: *Self) void {
-            if (self.payload_buf) |*ab| {
-                ab.deinit();
+            if (self.payload_buf) |*pb| {
+                try pb.appendSlice(buf);
+                var ret = pb.toOwnedSlice();
                 self.payload_buf = null;
+                return ret;
             }
+            return try cp(self.alloc, buf);
         }
 
-        pub fn deinit(self: *Self) void {
-            self.deinit_args();
-        }
     };
 }
 // reference implementation: https://github.com/nats-io/nats.go/blob/8af932f2076b3cab1a9a2f5aa2d9b59de2f1db6b/parser.go#L434
@@ -485,8 +463,8 @@ fn parse_msg_args(alloc: Allocator, buf: []const u8) !Msg {
     //print("\nparts:{s}\n", .{parts});
 
     if (part_no == 3) {
-        var sid = try std.fmt.parseUnsigned(u64, parts[1], 10);
-        var size = try std.fmt.parseUnsigned(u64, parts[2], 10);
+        var sid = try fmt.parseUnsigned(u64, parts[1], 10);
+        var size = try fmt.parseUnsigned(u64, parts[2], 10);
         return Msg{
             .subject = try cp(alloc, parts[0]),
             .sid = sid,
@@ -496,8 +474,8 @@ fn parse_msg_args(alloc: Allocator, buf: []const u8) !Msg {
         };
     }
     if (part_no == 4) {
-        var sid = try std.fmt.parseUnsigned(u64, parts[1], 10);
-        var size = try std.fmt.parseUnsigned(u64, parts[3], 10);
+        var sid = try fmt.parseUnsigned(u64, parts[1], 10);
+        var size = try fmt.parseUnsigned(u64, parts[3], 10);
         var subject = try cp(alloc, parts[0]);
         errdefer alloc.free(subject);
         return Msg{
@@ -748,14 +726,12 @@ test "decode server info operation JSON args into ServerInfo struct" {
 test "operation reader" {
     // opReader has buffer of 4096 bytes, big enough for whole stream of test data
     var opr = opReader(testing.allocator, bufferStream(test_info_ops), &assert_info_ops);
-    defer opr.deinit();
     try opr.loop();
 }
 
 test "operation reader with buffer overflow" {
     // tinyOpReader has buffer of 16 bytes, overflow occures
     var opr = tinyOpReader(testing.allocator, bufferStream(test_info_ops), &assert_info_ops);
-    defer opr.deinit();
     try opr.loop();
 }
 
@@ -772,7 +748,7 @@ var assert_info_ops = struct {
     no: usize = 0,
     const Self = @This();
 
-    fn on_op(self: *Self, op: Op) OpHandlerError!void {
+    fn on_op(self: *Self, op: Op) !void {
         switch (self.no) {
             0 => {
                 try expectEqual(op.info.args[0], '{');
@@ -796,7 +772,7 @@ test "operation reader with buffer overflow for different buffer sizes" {
         no: usize = 1,
         const Self = @This();
 
-        fn on_op(self: *Self, op: Op) OpHandlerError!void {
+        fn on_op(self: *Self, op: Op) !void {
             try expectEqual(self.no, op.info.args.len);
             self.no += 1;
         }
@@ -826,7 +802,6 @@ test "operation reader with buffer overflow for different buffer sizes" {
     var stream = bufferStream(cases.items);
     // tinyOpReader has buffer of 16 bytes, overflow occures
     var br = tinyOpReader(testing.allocator, stream, &handler);
-    defer br.deinit();
     try br.loop();
 }
 
@@ -835,7 +810,7 @@ fn test_parse_line(buf: []const u8) !Op {
     var handler = struct {
         last_op: Op = undefined,
         const Self = @This();
-        fn on_op(self: *Self, op: Op) OpHandlerError!void {
+        fn on_op(self: *Self, op: Op) !void {
             self.last_op = op;
         }
     }{};
@@ -882,7 +857,7 @@ test "parse msg args" {
     };
     for (not_a_number_cases) |case| {
         var err = parse_msg_args(testing.allocator, case);
-        try expectError(OpParseError.InvalidCharacter, err);
+        try expectError(fmt.ParseIntError.InvalidCharacter, err);
     }
 }
 
@@ -891,7 +866,7 @@ test "message operation reader" {
         no: usize = 1,
         const Self = @This();
 
-        fn on_op(self: *Self, op: Op) OpHandlerError!void {
+        fn on_op(self: *Self, op: Op) !void {
             //print("subject: '{s}'\n", .{op.msg.args.subject});
             try expect(mem.eql(u8, "subject", op.msg.subject));
             try expectEqual(self.no, op.msg.size);
@@ -907,7 +882,7 @@ test "message operation reader" {
     var i: usize = 1;
     while (i < 1024) : (i += 1) {
         try cases.appendSlice("MSG subject 123 ");
-        try std.fmt.format(cases.writer(), "{d}", .{i});
+        try fmt.format(cases.writer(), "{d}", .{i});
         try cases.appendSlice("\r\n");
         var j: usize = 0;
         while (j < i) : (j += 1) {
@@ -918,6 +893,5 @@ test "message operation reader" {
 
     var stream = bufferStream(cases.items);
     var br = tinyOpReader(testing.allocator, stream, &handler);
-    defer br.deinit();
     try br.loop();
 }
