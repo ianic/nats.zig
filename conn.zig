@@ -6,6 +6,14 @@ const Allocator = std.mem.Allocator;
 const bufferStream = std.io.fixedBufferStream;
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+
+    var conn = try Conn.connect();
+    try conn.loop(alloc);
+}
+
+pub fn main2() !void {
     const addr = try net.Address.parseIp4("127.0.0.1", 4222);
     const stream = try net.tcpConnectToAddress(addr);
     defer stream.close();
@@ -28,6 +36,51 @@ pub fn main() !void {
     }
 }
 
+const Conn = struct {
+    stream: std.net.Stream,
+    //reader: std.net.Stream.Reader,
+    //writer: std.net.Stream.Writer,
+
+    const Self = @This();
+
+    pub fn connect() !Conn {
+        const addr = try net.Address.parseIp4("127.0.0.1", 4222);
+        const stream = try net.tcpConnectToAddress(addr);
+        return Conn{
+            .stream = stream,
+        };
+    }
+
+    pub fn loop(self: *Self, alloc: Allocator) !void {
+        var opr = opReader(alloc, self.stream, self);
+        try opr.loop();
+    }
+
+    fn on_op(self: *Self, op: Op) !void {
+        print("> {}\n", .{op});
+
+        switch (op) {
+            .info => try self.send(connect_op),
+            .msg => {},
+            .ok => {},
+            .err => {},
+            .ping => try self.send(pong_op),
+            else => {},
+        }
+    }
+
+    fn send(self: *Self, buf: []const u8) !void {
+        print("< {s}\n", .{buf});
+        _ = try self.stream.write(buf);
+    }
+
+    fn deinit(self: *Self) void {
+        self.stream.close();
+    }
+};
+
+const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
+const pong_op = "PONG\r\n";
 // protocol operations
 // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#protocol-messages
 const OpName = enum {
@@ -52,7 +105,7 @@ const Op = union(OpName) {
     info: Info,
     msg: Msg,
     ok,
-    err: struct { args: []const u8 },
+    err: OpErr,
 
     connect,
     pub_op,
@@ -68,6 +121,7 @@ const Op = union(OpName) {
         switch (op) {
             .info => op.info.deinit(),
             .msg => op.msg.deinit(),
+            .err => op.err.deinit(),
             else => {},
         }
     }
@@ -418,11 +472,13 @@ pub fn OpReader(
         fn on_info(self: *Self, buf: []const u8) !void {
             var args = try self.get_args(buf);
             var info = try Info.json_parse(self.alloc, args);
-            try self.handler.on_op(Op{ .info = info});
+            try self.handler.on_op(Op{ .info = info });
         }
 
         fn on_err(self: *Self, buf: []const u8) !void {
-            try self.handler.on_op(Op{ .err = .{ .args = try self.get_args(buf) } });
+            var desc = try cp(self.alloc, try self.get_args(buf));
+            var oe = OpErr{ .desc = desc, .alloc = self.alloc };
+            try self.handler.on_op(Op{ .err = oe });
         }
 
         fn get_args(self: *Self, buf: []const u8) ![]const u8 {
@@ -649,6 +705,15 @@ const Info = struct {
     }
 };
 
+const OpErr = struct {
+    desc: []const u8,
+    alloc: Allocator,
+
+    fn deinit(self: OpErr) void {
+        self.alloc.free(self.desc);
+    }
+};
+
 const testing = std.testing;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
@@ -732,11 +797,12 @@ test "parse err operation" {
         var op = try test_parse_line(buf);
         try expect(op == .err);
         switch (i) {
-            0 => try expect(mem.eql(u8, "'Stale Connection'", op.err.args)),
-            1 => try expect(mem.eql(u8, "'Unknown Protocol Operation'", op.err.args)),
-            2 => try expect(mem.eql(u8, "'Permissions Violation for Subscription to foo.bar'", op.err.args)),
+            0 => try expect(mem.eql(u8, "'Stale Connection'", op.err.desc)),
+            1 => try expect(mem.eql(u8, "'Unknown Protocol Operation'", op.err.desc)),
+            2 => try expect(mem.eql(u8, "'Permissions Violation for Subscription to foo.bar'", op.err.desc)),
             else => {},
         }
+        op.deinit();
     }
 }
 
@@ -748,6 +814,7 @@ test "args line too long" {
     try max_line.appendSlice("\r\n");
     var op = try test_parse_line(max_line.items);
     try expect(op == .err);
+    op.deinit();
 
     var too_long = std.ArrayList(u8).init(testing.allocator);
     defer too_long.deinit();
@@ -855,7 +922,7 @@ test "operation reader with buffer overflow for different buffer sizes" {
             try cases.append('a');
         }
         try cases.appendSlice("\"}");
-        if (i%2 == 0) { // use both line ending \r\n and just \n
+        if (i % 2 == 0) { // use both line ending \r\n and just \n
             try cases.appendSlice("\r\n");
         } else {
             try cases.appendSlice("\n");
