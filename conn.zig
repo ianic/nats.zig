@@ -5,43 +5,13 @@ const fmt = std.fmt;
 const Allocator = std.mem.Allocator;
 const bufferStream = std.io.fixedBufferStream;
 
-// pub fn main() !void {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     const alloc = gpa.allocator();
-
-//     var conn = try Conn.connect();
-//     conn.run(alloc);
-// }
-
-// pub fn main2() !void {
-//     const addr = try net.Address.parseIp4("127.0.0.1", 4222);
-//     const stream = try net.tcpConnectToAddress(addr);
-//     defer stream.close();
-//     const rdr = stream.reader();
-
-//     const max_control_line_size = 4096;
-//     var buf: [max_control_line_size]u8 = undefined;
-//     var bytes = try rdr.read(&buf);
-
-//     print("got bytes: {d}\n", .{bytes});
-//     print("data: {s}\n", .{buf[0..bytes]});
-
-//     while (true) {
-//         bytes = try rdr.read(&buf);
-//         print("got bytes: {d}\n", .{bytes});
-//         print("data: {s}\n", .{buf[0..bytes]});
-//         if (bytes == 0) {
-//             break;
-//         }
-//     }
-// }
-
 pub fn connect(alloc: Allocator) !Conn {
     return try Conn.connect(alloc);
 }
 
 pub const Conn = struct {
     stream: std.net.Stream,
+    scratch: [max_args_len]u8 = undefined,
     alloc: Allocator,
 
     const Self = @This();
@@ -79,12 +49,26 @@ pub const Conn = struct {
         _ = try self.stream.write(buf);
     }
 
+    // just for pretty printing
+    fn send_more(self: *Self, buf: []const u8) !void {
+        print("  {s}", .{buf});
+        _ = try self.stream.write(buf);
+    }
+
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
-        _ = try self.stream.write("PUB ");
-        _ = try self.stream.write(subject);
-        try fmt.format(self.stream.writer(), " {d}\r\n", .{data.len});
-        _ = try self.stream.write(data);
-        _ = try self.stream.write("\r\n");
+        var buf = self.scratch[0..];
+        mem.copy(u8, buf[0..], "PUB ");
+        var offset: usize = 4;
+        mem.copy(u8, buf[offset..], subject);
+        offset += subject.len;
+        mem.copy(u8, buf[offset..], " ");
+        offset += 1;
+        offset += fmt.formatIntBuf(self.scratch[offset..], data.len, 10, .lower, .{});
+        mem.copy(u8, buf[offset..], "\r\n");
+        offset += 2;
+        try self.send(buf[0..offset]);
+        try self.send_more(data);
+        try self.send_more("\r\n");
     }
 
     pub fn deinit(self: *Self) void {
