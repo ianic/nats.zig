@@ -5,59 +5,64 @@ const fmt = std.fmt;
 const Allocator = std.mem.Allocator;
 const bufferStream = std.io.fixedBufferStream;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
+// pub fn main() !void {
+//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//     const alloc = gpa.allocator();
 
-    var conn = try Conn.connect();
-    try conn.loop(alloc);
+//     var conn = try Conn.connect();
+//     conn.run(alloc);
+// }
+
+// pub fn main2() !void {
+//     const addr = try net.Address.parseIp4("127.0.0.1", 4222);
+//     const stream = try net.tcpConnectToAddress(addr);
+//     defer stream.close();
+//     const rdr = stream.reader();
+
+//     const max_control_line_size = 4096;
+//     var buf: [max_control_line_size]u8 = undefined;
+//     var bytes = try rdr.read(&buf);
+
+//     print("got bytes: {d}\n", .{bytes});
+//     print("data: {s}\n", .{buf[0..bytes]});
+
+//     while (true) {
+//         bytes = try rdr.read(&buf);
+//         print("got bytes: {d}\n", .{bytes});
+//         print("data: {s}\n", .{buf[0..bytes]});
+//         if (bytes == 0) {
+//             break;
+//         }
+//     }
+// }
+
+pub fn connect(alloc: Allocator) !Conn {
+    return try Conn.connect(alloc);
 }
 
-pub fn main2() !void {
-    const addr = try net.Address.parseIp4("127.0.0.1", 4222);
-    const stream = try net.tcpConnectToAddress(addr);
-    defer stream.close();
-    const rdr = stream.reader();
-
-    const max_control_line_size = 4096;
-    var buf: [max_control_line_size]u8 = undefined;
-    var bytes = try rdr.read(&buf);
-
-    print("got bytes: {d}\n", .{bytes});
-    print("data: {s}\n", .{buf[0..bytes]});
-
-    while (true) {
-        bytes = try rdr.read(&buf);
-        print("got bytes: {d}\n", .{bytes});
-        print("data: {s}\n", .{buf[0..bytes]});
-        if (bytes == 0) {
-            break;
-        }
-    }
-}
-
-const Conn = struct {
+pub const Conn = struct {
     stream: std.net.Stream,
-    //reader: std.net.Stream.Reader,
-    //writer: std.net.Stream.Writer,
+    alloc: Allocator,
 
     const Self = @This();
 
-    pub fn connect() !Conn {
+    pub fn connect(alloc: Allocator) !Conn {
         const addr = try net.Address.parseIp4("127.0.0.1", 4222);
         const stream = try net.tcpConnectToAddress(addr);
         return Conn{
             .stream = stream,
+            .alloc = alloc,
         };
     }
 
-    pub fn loop(self: *Self, alloc: Allocator) !void {
-        var opr = opReader(alloc, self.stream, self);
-        try opr.loop();
+    pub fn run(self: *Conn) void {
+        var opr = opReader(self.alloc, self.stream, self);
+        // TODO handler error, function can't return error for use in event.Loop
+        opr.loop() catch unreachable;
     }
 
     fn on_op(self: *Self, op: Op) !void {
-        print("> {}\n", .{op});
+        //print("> {}\n", .{op});
 
         switch (op) {
             .info => try self.send(connect_op),
@@ -70,11 +75,19 @@ const Conn = struct {
     }
 
     fn send(self: *Self, buf: []const u8) !void {
-        print("< {s}\n", .{buf});
+        print("< {s}", .{buf});
         _ = try self.stream.write(buf);
     }
 
-    fn deinit(self: *Self) void {
+    pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
+        _ = try self.stream.write("PUB ");
+        _ = try self.stream.write(subject);
+        try fmt.format(self.stream.writer(), " {d}\r\n", .{data.len});
+        _ = try self.stream.write(data);
+        _ = try self.stream.write("\r\n");
+    }
+
+    pub fn deinit(self: *Self) void {
         self.stream.close();
     }
 };
@@ -202,6 +215,7 @@ pub fn OpReader(
                 if (bytes_read == 0) {
                     return;
                 }
+                print("> {s}", .{buf[0..bytes_read]});
                 try self.parse(buf[0..bytes_read]);
             }
         }
@@ -351,7 +365,10 @@ pub fn OpReader(
                             ' ', '\t' => {
                                 self.state = .err_;
                             },
-                            else => return OpParseError.UnexpectedToken,
+                            else => {
+                                print("b: {c}, buf: {s}\n", .{ b, buf });
+                                return OpParseError.UnexpectedToken;
+                            },
                         }
                     },
                     .err_ => {
@@ -378,13 +395,13 @@ pub fn OpReader(
                     },
                     .plus => {
                         switch (b) {
-                            'O', 'o' => self.state = .err,
+                            'O', 'o' => self.state = .o,
                             else => return OpParseError.UnexpectedToken,
                         }
                     },
                     .o => {
                         switch (b) {
-                            'K', 'k' => self.state = .err,
+                            'K', 'k' => self.state = .ok,
                             else => return OpParseError.UnexpectedToken,
                         }
                     },
