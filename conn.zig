@@ -1,5 +1,6 @@
 const std = @import("std");
 const print = std.debug.print;
+const assert = std.debug.assert;
 const net = std.net;
 const fmt = std.fmt;
 const Allocator = std.mem.Allocator;
@@ -9,9 +10,18 @@ pub fn connect(alloc: Allocator) !Conn {
     return try Conn.connect(alloc);
 }
 
+const Subscription = struct {
+    handler: *MsgHandler,
+};
+
 pub const Conn = struct {
     stream: std.net.Stream,
     scratch: [max_args_len]u8 = undefined,
+
+    ssid: u64 = 0,
+    subs: std.AutoHashMap(u64, Subscription),
+    op_builder: OpBuilder = OpBuilder{},
+
     alloc: Allocator,
 
     const Self = @This();
@@ -22,53 +32,65 @@ pub const Conn = struct {
         return Conn{
             .stream = stream,
             .alloc = alloc,
+            .subs = std.AutoHashMap(u64, Subscription).init(alloc),
         };
     }
 
     pub fn run(self: *Conn) void {
         var opr = opReader(self.alloc, self.stream, self);
-        // TODO handler error, function can't return error for use in event.Loop
+        // TODO handle error, function can't return error for use in event.Loop
         opr.loop() catch unreachable;
     }
 
     fn on_op(self: *Self, op: Op) !void {
-        //print("> {}\n", .{op});
-
         switch (op) {
-            .info => try self.send(connect_op),
-            .msg => {},
+            .info => try self.sendOp(connect_op),
+            .msg => |msg| {
+                if (self.subs.get(msg.sid)) |sub| {
+                    sub.handler.onMsg(msg);
+                } else {
+                    std.log.warn("no subscription for sid: {d}", .{msg.sid});
+                }
+            },
             .ok => {},
             .err => {},
-            .ping => try self.send(pong_op),
+            .ping => try self.sendOp(pong_op),
             else => {},
         }
     }
 
-    fn send(self: *Self, buf: []const u8) !void {
+    fn sendOp(self: *Self, buf: []const u8) !void {
         print("< {s}", .{buf});
         _ = try self.stream.write(buf);
     }
 
     // just for pretty printing
-    fn send_more(self: *Self, buf: []const u8) !void {
-        print("  {s}", .{buf});
+    fn sendPayload(self: *Self, buf: []const u8) !void {
+        print("  {s}\n", .{buf});
         _ = try self.stream.write(buf);
+        _ = try self.stream.write(cr_lf);
     }
 
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
-        var buf = self.scratch[0..];
-        mem.copy(u8, buf[0..], "PUB ");
-        var offset: usize = 4;
-        mem.copy(u8, buf[offset..], subject);
-        offset += subject.len;
-        mem.copy(u8, buf[offset..], " ");
-        offset += 1;
-        offset += fmt.formatIntBuf(self.scratch[offset..], data.len, 10, .lower, .{});
-        mem.copy(u8, buf[offset..], "\r\n");
-        offset += 2;
-        try self.send(buf[0..offset]);
-        try self.send_more(data);
-        try self.send_more("\r\n");
+        try self.sendOp(self.op_builder.pub_op(subject, data.len));
+        try self.sendPayload(data);
+    }
+
+    pub fn subscribe(self: *Self, subject: []const u8, handler: *MsgHandler) !u64 {
+        self.ssid += 1;
+        var sid = self.ssid;
+        var sub = Subscription{
+            .handler = handler,
+        };
+        try self.subs.put(sid, sub);
+        errdefer _ = self.subs.remove(sid);
+        try self.sendOp(self.op_builder.sub(subject, sid));
+        return sid;
+    }
+
+    pub fn unSubscribe(self: *Self, sid: u64) !void {
+        try self.sendOp(self.op_builder.unsub(sid));
+        _ = self.subs.remove(sid);
     }
 
     pub fn deinit(self: *Self) void {
@@ -78,6 +100,7 @@ pub const Conn = struct {
 
 const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
 const pong_op = "PONG\r\n";
+
 // protocol operations
 // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#protocol-messages
 const OpName = enum {
@@ -199,7 +222,7 @@ pub fn OpReader(
                 if (bytes_read == 0) {
                     return;
                 }
-                print("> {s}", .{buf[0..bytes_read]});
+                //print("> {s}", .{buf[0..bytes_read]});
                 try self.parse(buf[0..bytes_read]);
             }
         }
@@ -223,10 +246,7 @@ pub fn OpReader(
                             'M', 'm' => self.state = .m,
                             '-' => self.state = .minus,
                             '+' => self.state = .plus,
-                            else => {
-                                //print("\nunexpected token '{s}' {d} {c}\n", .{buf, i, b});
-                                return OpParseError.UnexpectedToken;
-                            },
+                            else => return OpParseError.UnexpectedToken,
                         }
                     },
                     .p => {
@@ -349,10 +369,7 @@ pub fn OpReader(
                             ' ', '\t' => {
                                 self.state = .err_;
                             },
-                            else => {
-                                print("b: {c}, buf: {s}\n", .{ b, buf });
-                                return OpParseError.UnexpectedToken;
-                            },
+                            else => return OpParseError.UnexpectedToken,
                         }
                     },
                     .err_ => {
@@ -604,7 +621,7 @@ fn cp(alloc: Allocator, src: []const u8) ![]u8 {
     return dest;
 }
 
-const Msg = struct {
+pub const Msg = struct {
     subject: []const u8,
     sid: u64,
     reply: ?[]const u8,
@@ -621,6 +638,14 @@ const Msg = struct {
         }
         if (self.payload != null) {
             self.alloc.free(self.payload.?);
+        }
+    }
+
+    pub fn data(self: Self) []const u8 {
+        if (self.payload) |p| {
+            return p;
+        } else {
+            return empty_str;
         }
     }
 };
@@ -718,6 +743,7 @@ const OpErr = struct {
 const testing = std.testing;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
+const expectEqualStrings = std.testing.expectEqualStrings;
 const expectError = std.testing.expectError;
 const mem = std.mem;
 
@@ -1026,3 +1052,85 @@ test "message operation reader" {
     var br = tinyOpReader(testing.allocator, stream, &handler);
     try br.loop();
 }
+
+const OpBuilder = struct {
+    scratch: [max_args_len]u8 = undefined,
+
+    const Self = @This();
+    fn unsub(self: *Self, sid: u64) []const u8 {
+        var buf = self.scratch[0..];
+        mem.copy(u8, buf[0..], "UNSUB ");
+        var offset: usize = 5;
+        mem.copy(u8, buf[offset..], " ");
+        offset += 1;
+        offset += fmt.formatIntBuf(self.scratch[offset..], sid, 10, .lower, .{});
+        mem.copy(u8, buf[offset..], cr_lf);
+        offset += 2;
+        return buf[0..offset];
+    }
+
+    fn sub(self: *Self, subject: []const u8, sid: u64) []const u8 {
+        var buf = self.scratch[0..];
+        mem.copy(u8, buf[0..], "SUB ");
+        var offset: usize = 4;
+        mem.copy(u8, buf[offset..], subject);
+        offset += subject.len;
+        mem.copy(u8, buf[offset..], " ");
+        offset += 1;
+        offset += fmt.formatIntBuf(self.scratch[offset..], sid, 10, .lower, .{});
+        mem.copy(u8, buf[offset..], cr_lf);
+        offset += 2;
+        return buf[0..offset];
+    }
+
+    fn pub_op(self: *Self, subject: []const u8, size: u64) []const u8 {
+        var buf = self.scratch[0..];
+        mem.copy(u8, buf[0..], "PUB ");
+        var offset: usize = 4;
+        mem.copy(u8, buf[offset..], subject);
+        offset += subject.len;
+        mem.copy(u8, buf[offset..], " ");
+        offset += 1;
+        offset += fmt.formatIntBuf(self.scratch[offset..], size, 10, .lower, .{});
+        mem.copy(u8, buf[offset..], cr_lf);
+        offset += 2;
+        return buf[0..offset];
+    }
+};
+
+test "operation builder" {
+    var ob = OpBuilder{};
+
+    try expectEqualStrings("UNSUB 1234\r\n", ob.unsub(1234));
+    try expectEqualStrings("SUB foo.bar 4567\r\n", ob.sub("foo.bar", 4567));
+    try expectEqualStrings("PUB foo.bar 8901\r\n", ob.pub_op("foo.bar", 8901));
+}
+
+const cr_lf = "\r\n";
+
+// ref: https://revivalizer.xyz/post/the-missing-zig-polymorphism-reference/
+pub const MsgHandler = struct {
+    ptr: usize = undefined,
+    v_table: struct {
+        onMsg: fn (self: *MsgHandler, msg: Msg) void,
+    } = undefined,
+
+    pub fn onMsg(self: *MsgHandler, msg: Msg) void {
+        return self.v_table.onMsg(self, msg);
+    }
+
+    pub fn init(pointer: anytype) MsgHandler {
+        const Ptr = @TypeOf(pointer);
+        assert(@typeInfo(Ptr) == .Pointer); // Must be a pointer
+        assert(@typeInfo(Ptr).Pointer.size == .One); // Must be a single-item pointer
+        assert(@typeInfo(@typeInfo(Ptr).Pointer.child) == .Struct); // Must point to a struct
+
+        return MsgHandler{ .ptr = @ptrToInt(pointer), .v_table = .{
+            .onMsg = struct {
+                fn onMsg(self: *MsgHandler, msg: Msg) void {
+                    return @intToPtr(Ptr, self.ptr).onMsg(msg);
+                }
+            }.onMsg,
+        } };
+    }
+};

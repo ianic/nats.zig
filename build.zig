@@ -19,6 +19,7 @@ pub fn build(b: *std.build.Builder) void {
     const example_step = b.step("examples", "Build examples");
     inline for (.{
         "pub",
+        "sub",
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
         example.addPackagePath("nats", "conn.zig");
