@@ -494,7 +494,7 @@ pub fn OpReader(
         }
 
         fn on_err(self: *Self, buf: []const u8) !void {
-            var desc = try cp(self.alloc, try self.get_args(buf));
+            var desc = try self.alloc.dupe(u8, try self.get_args(buf));
             var oe = OpErr{ .desc = desc, .alloc = self.alloc };
             try self.handler.on_op(Op{ .err = oe });
         }
@@ -539,9 +539,9 @@ pub fn OpReader(
                 if (self.payload_buf_owned) {
                     return self.payload_buf[0..self.payload_buf_len];
                 }
-                return try cp(self.alloc, self.payload_buf[0..self.payload_buf_len]);
+                return try self.alloc.dupe(u8, self.payload_buf[0..self.payload_buf_len]);
             }
-            return try cp(self.alloc, buf);
+            return try self.alloc.dupe(u8, buf);
         }
 
         fn reset_payload_buf(self: *Self) void {
@@ -592,7 +592,7 @@ fn parse_msg_args(alloc: Allocator, buf: []const u8) !Msg {
         var sid = try fmt.parseUnsigned(u64, parts[1], 10);
         var size = try fmt.parseUnsigned(u64, parts[2], 10);
         return Msg{
-            .subject = try cp(alloc, parts[0]),
+            .subject = try alloc.dupe(u8, parts[0]),
             .sid = sid,
             .reply = null,
             .size = size,
@@ -602,23 +602,17 @@ fn parse_msg_args(alloc: Allocator, buf: []const u8) !Msg {
     if (part_no == 4) {
         var sid = try fmt.parseUnsigned(u64, parts[1], 10);
         var size = try fmt.parseUnsigned(u64, parts[3], 10);
-        var subject = try cp(alloc, parts[0]);
+        var subject = try alloc.dupe(u8, parts[0]);
         errdefer alloc.free(subject);
         return Msg{
             .subject = subject,
             .sid = sid,
-            .reply = try cp(alloc, parts[2]),
+            .reply = try alloc.dupe(u8, parts[2]),
             .size = size,
             .alloc = alloc,
         };
     }
     return OpParseError.UnexpectedMsgArgs;
-}
-
-fn cp(alloc: Allocator, src: []const u8) ![]u8 {
-    const dest = try alloc.alloc(u8, src.len);
-    mem.copy(u8, dest, src);
-    return dest;
 }
 
 pub const Msg = struct {
