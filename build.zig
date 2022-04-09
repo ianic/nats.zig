@@ -6,7 +6,7 @@ pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
 
-    const lib = b.addStaticLibrary("nats", "conn.zig");
+    const lib = b.addStaticLibrary("nats", "./src/conn.zig");
     lib.setBuildMode(mode);
     lib.install();
 
@@ -22,7 +22,7 @@ pub fn build(b: *std.build.Builder) void {
         "sub",
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
-        example.addPackagePath("nats", "conn.zig");
+        example.addPackagePath("nats", "./src/conn.zig");
         example.setBuildMode(mode);
         example.setTarget(target);
         example.install();

@@ -32,15 +32,15 @@ pub fn run(conn: *Conn) void {
 
 const log = std.log.scoped(.nats);
 fn debugConnIn(buf: []const u8) void {
-    if (buf[buf.len-1] == '\n') {
-        log.debug("> {s}", .{buf[0..buf.len-1]});
+    if (buf[buf.len - 1] == '\n') {
+        log.debug("> {s}", .{buf[0 .. buf.len - 1]});
     } else {
         log.debug("> {s}", .{buf[0..]});
     }
 }
 fn debugConnOut(buf: []const u8) void {
-    if (buf[buf.len-1] == '\n') {
-        log.debug("< {s}", .{buf[0..buf.len-1]});
+    if (buf[buf.len - 1] == '\n') {
+        log.debug("< {s}", .{buf[0 .. buf.len - 1]});
     } else {
         log.debug("< {s}", .{buf[0..]});
     }
