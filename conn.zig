@@ -30,6 +30,22 @@ pub fn run(conn: *Conn) void {
     conn.run();
 }
 
+const log = std.log.scoped(.nats);
+fn debugConnIn(buf: []const u8) void {
+    if (buf[buf.len-1] == '\n') {
+        log.debug("> {s}", .{buf[0..buf.len-1]});
+    } else {
+        log.debug("> {s}", .{buf[0..]});
+    }
+}
+fn debugConnOut(buf: []const u8) void {
+    if (buf[buf.len-1] == '\n') {
+        log.debug("< {s}", .{buf[0..buf.len-1]});
+    } else {
+        log.debug("< {s}", .{buf[0..]});
+    }
+}
+
 const ConnectError = error{
     HandshakeFailed,
     ServerError,
@@ -51,6 +67,7 @@ pub const Conn = struct {
     pub fn connect(alloc: Allocator) !Conn {
         const addr = try net.Address.parseIp4("127.0.0.1", 4222);
         const stream = try net.tcpConnectToAddress(addr);
+
         var conn = Conn{
             .stream = stream,
             .alloc = alloc,
@@ -88,6 +105,7 @@ pub const Conn = struct {
 
         // expect INFO at start
         var offset = try self.stream.read(buf[0..]);
+        debugConnIn(buf[0..offset]);
         try parser.parse(buf[0..offset]);
         if (!handler.got_info) {
             return ConnectError.HandshakeFailed;
@@ -95,11 +113,12 @@ pub const Conn = struct {
         self.info = handler.info;
 
         // send CONNECT, PING
-        _ = try self.stream.write(connect_op);
-        _ = try self.stream.write(ping_op);
+        _ = try self.sendOp(connect_op);
+        _ = try self.sendOp(ping_op);
 
         // expect PONG
         offset = try self.stream.read(buf[0..]);
+        debugConnIn(buf[0..offset]);
         try parser.parse(buf[0..offset]);
         if (!handler.got_pong) {
             return ConnectError.HandshakeFailed;
@@ -115,14 +134,14 @@ pub const Conn = struct {
     fn loop(self: *Conn) !void {
         var parser = Parser.init(self.alloc, &OpHandler.init(self));
 
+        var i: usize = 0;
         var buf: [conn_read_buffer_size]u8 = undefined;
-        while (true) {
+        while (true) : (i += 1) {
             var bytes_read = try self.stream.read(buf[0..]);
             if (bytes_read == 0) {
-                //print("loop exit \n", .{});
                 return;
             }
-            print("> {s}", .{buf[0..bytes_read]});
+            debugConnIn(buf[0..bytes_read]);
             try parser.parse(buf[0..bytes_read]);
         }
     }
@@ -164,12 +183,12 @@ pub const Conn = struct {
     }
 
     fn sendOp(self: *Self, buf: []const u8) !void {
-        print("< {s}", .{buf});
+        debugConnOut(buf);
         _ = try self.stream.write(buf);
     }
 
     fn sendPayload(self: *Self, buf: []const u8) !void {
-        print("  {s}\n", .{buf});
+        debugConnOut(buf);
         _ = try self.stream.write(buf);
         _ = try self.stream.write(cr_lf);
     }

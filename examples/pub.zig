@@ -1,11 +1,10 @@
 const std = @import("std");
 const event = std.event;
-const print = std.debug.print;
-const Allocator = std.mem.Allocator;
 const nats = @import("nats");
 
 pub const io_mode = .evented;
 pub const event_loop_mode = .single_threaded;
+pub const log_level: std.log.Level = .debug;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
