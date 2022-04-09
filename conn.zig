@@ -102,8 +102,8 @@ pub const Conn = struct {
     }
 
     fn sendOp(self: *Self, buf: []const u8) !void {
-            print("< {s}", .{buf});
-            _ = try self.stream.write(buf);
+        print("< {s}", .{buf});
+        _ = try self.stream.write(buf);
     }
 
     // just for pretty printing
@@ -114,7 +114,7 @@ pub const Conn = struct {
     }
 
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
-        try self.sendOp(self.op_builder.pub_op(subject, data.len));
+        try self.sendOp(self.op_builder.pubOp(subject, data.len));
         try self.sendPayload(data);
     }
 
@@ -230,7 +230,7 @@ const ParserState = enum {
 };
 
 // reference implementation: https://github.com/nats-io/nats.go/blob/8af932f2076b3cab1a9a2f5aa2d9b59de2f1db6b/parser.go#L434
-fn parse_msg_args(alloc: Allocator, buf: []const u8) !Msg {
+fn parseMsgArgs(alloc: Allocator, buf: []const u8) !Msg {
     var parts: [4][]const u8 = .{empty_str} ** 4;
     var part_no: usize = 0;
 
@@ -294,21 +294,21 @@ fn parse_msg_args(alloc: Allocator, buf: []const u8) !Msg {
 }
 
 test "parse msg args" {
-    var ma = try parse_msg_args(testing.allocator, "foo.bar 9 11");
+    var ma = try parseMsgArgs(testing.allocator, "foo.bar 9 11");
     try expect(mem.eql(u8, ma.subject, "foo.bar"));
     try expect(ma.reply == null);
     try expectEqual(ma.sid, 9);
     try expectEqual(ma.size, 11);
     ma.deinit();
 
-    ma = try parse_msg_args(testing.allocator, "bar.foo 10 INBOX.34 12");
+    ma = try parseMsgArgs(testing.allocator, "bar.foo 10 INBOX.34 12");
     try expect(mem.eql(u8, ma.subject, "bar.foo"));
     try expect(mem.eql(u8, ma.reply.?, "INBOX.34"));
     try expectEqual(ma.sid, 10);
     try expectEqual(ma.size, 12);
     ma.deinit();
 
-    ma = try parse_msg_args(testing.allocator, "bar.foo.bar    11\tINBOX.35           13 ");
+    ma = try parseMsgArgs(testing.allocator, "bar.foo.bar    11\tINBOX.35           13 ");
     try expect(mem.eql(u8, ma.subject, "bar.foo.bar"));
     try expect(mem.eql(u8, ma.reply.?, "INBOX.35"));
     try expectEqual(ma.sid, 11);
@@ -320,7 +320,7 @@ test "parse msg args" {
         "bar.foo 12", // too few arguments
     };
     for (cases) |case| {
-        var err = parse_msg_args(testing.allocator, case);
+        var err = parseMsgArgs(testing.allocator, case);
         try expectError(OpParseError.UnexpectedMsgArgs, err);
     }
 
@@ -329,7 +329,7 @@ test "parse msg args" {
         "bar.foo sid_not_a_number, 11",
     };
     for (not_a_number_cases) |case| {
-        var err = parse_msg_args(testing.allocator, case);
+        var err = parseMsgArgs(testing.allocator, case);
         try expectError(fmt.ParseIntError.InvalidCharacter, err);
     }
 }
@@ -394,7 +394,7 @@ const Info = struct {
     args: Args,
     alloc: Allocator,
 
-    fn json_parse(alloc: Allocator, buf: []const u8) !Info {
+    fn jsonParse(alloc: Allocator, buf: []const u8) !Info {
         // fixing error: evaluation exceeded 1000 backwards branches
         // ref: https://github.com/ziglang/zig/issues/9728
         @setEvalBranchQuota(1024 * 8);
@@ -432,13 +432,13 @@ const test_info_op =
 
 test "decode server info operation JSON args into ServerInfo struct" {
     var alloc = std.testing.allocator;
-    var si = try Info.json_parse(alloc, test_info_op);
+    var si = try Info.jsonParse(alloc, test_info_op);
     defer si.deinit();
 
-    try assert_info_args(si.args);
+    try assertInfoArgs(si.args);
 }
 
-fn assert_info_args(args: Info.Args) !void {
+fn assertInfoArgs(args: Info.Args) !void {
     try expect(mem.eql(u8, "id", args.server_id));
     try expect(mem.eql(u8, "name", args.server_name));
     try expect(mem.eql(u8, "2.8.0", args.version));
@@ -487,7 +487,7 @@ const OpBuilder = struct {
         return buf[0..offset];
     }
 
-    fn pub_op(self: *Self, subject: []const u8, size: u64) []const u8 {
+    fn pubOp(self: *Self, subject: []const u8, size: u64) []const u8 {
         var buf = self.scratch[0..];
         mem.copy(u8, buf[0..], "PUB ");
         var offset: usize = 4;
@@ -507,7 +507,7 @@ test "operation builder" {
 
     try expectEqualStrings("UNSUB 1234\r\n", ob.unsub(1234));
     try expectEqualStrings("SUB foo.bar 4567\r\n", ob.sub("foo.bar", 4567));
-    try expectEqualStrings("PUB foo.bar 8901\r\n", ob.pub_op("foo.bar", 8901));
+    try expectEqualStrings("PUB foo.bar 8901\r\n", ob.pubOp("foo.bar", 8901));
 }
 
 // ref: https://revivalizer.xyz/post/the-missing-zig-polymorphism-reference/
@@ -704,7 +704,7 @@ const Parser = struct {
                         },
                         '\n' => {
                             //print("\n[{d}..{d}]", .{ args_start, i - drop });
-                            try self.on_info(buf[args_start .. i - drop]);
+                            try self.onInfo(buf[args_start .. i - drop]);
                             self.state = .start;
                         },
                         else => {},
@@ -752,7 +752,7 @@ const Parser = struct {
                             drop = 1;
                         },
                         '\n' => {
-                            try self.on_err(buf[args_start .. i - drop]);
+                            try self.onErr(buf[args_start .. i - drop]);
                             self.state = .start;
                         },
                         else => {},
@@ -813,7 +813,7 @@ const Parser = struct {
                             drop = 1;
                         },
                         '\n' => {
-                            var msg = try parse_msg_args(self.alloc, try self.get_args(buf[args_start .. i - drop]));
+                            var msg = try parseMsgArgs(self.alloc, try self.getArgs(buf[args_start .. i - drop]));
                             self.msg = msg;
                             self.state = .msg_payload;
                             self.payload_size = msg.size;
@@ -823,14 +823,14 @@ const Parser = struct {
                 },
                 .msg_payload => {
                     if (buf.len >= i + self.payload_size) {
-                        try self.on_msg(buf[i .. i + self.payload_size]);
+                        try self.onMsg(buf[i .. i + self.payload_size]);
                         i += self.payload_size - 1;
                         self.payload_size = 0;
                         self.state = .start;
                     } else {
                         // split buffer, save what we have so far
                         var pbuf = buf[i..];
-                        try self.push_payload(pbuf);
+                        try self.pushPayload(pbuf);
                         self.payload_size -= pbuf.len;
                         return;
                     }
@@ -840,40 +840,40 @@ const Parser = struct {
 
         // check for split buffer scenarios
         if (self.state == .info_args or self.state == .err_args or self.state == .msg_args) {
-            try self.push_args(buf[args_start .. buf.len - drop]);
+            try self.pushArgs(buf[args_start .. buf.len - drop]);
         }
     }
 
-    fn on_msg(self: *Self, buf: []const u8) !void {
+    fn onMsg(self: *Self, buf: []const u8) !void {
         var msg = self.msg.?;
-        msg.payload = try self.get_payload(buf);
+        msg.payload = try self.getPayload(buf);
         self.handler.onOp(Op{ .msg = msg });
         self.msg = null;
     }
 
-    fn on_info(self: *Self, buf: []const u8) !void {
-        var args = try self.get_args(buf);
-        var info = try Info.json_parse(self.alloc, args);
+    fn onInfo(self: *Self, buf: []const u8) !void {
+        var args = try self.getArgs(buf);
+        var info = try Info.jsonParse(self.alloc, args);
         self.handler.onOp(Op{ .info = info });
     }
 
-    fn on_err(self: *Self, buf: []const u8) !void {
-        var desc = try self.alloc.dupe(u8, try self.get_args(buf));
+    fn onErr(self: *Self, buf: []const u8) !void {
+        var desc = try self.alloc.dupe(u8, try self.getArgs(buf));
         var oe = OpErr{ .desc = desc, .alloc = self.alloc };
         self.handler.onOp(Op{ .err = oe });
     }
 
-    fn get_args(self: *Self, buf: []const u8) ![]const u8 {
+    fn getArgs(self: *Self, buf: []const u8) ![]const u8 {
         if (self.args_buf_len == 0) {
             return buf;
         }
-        try self.push_args(buf);
+        try self.pushArgs(buf);
         var acc = self.args_buf[0..self.args_buf_len];
         self.args_buf_len = 0;
         return acc;
     }
 
-    fn push_args(self: *Self, buf: []const u8) !void {
+    fn pushArgs(self: *Self, buf: []const u8) !void {
         if (self.args_buf_len + buf.len > max_args_len) {
             return OpParseError.ArgsTooLong;
         }
@@ -881,7 +881,7 @@ const Parser = struct {
         self.args_buf_len += buf.len;
     }
 
-    fn push_payload(self: *Self, buf: []const u8) !void {
+    fn pushPayload(self: *Self, buf: []const u8) !void {
         var new_len = self.payload_buf_len + buf.len;
         if (new_len > self.payload_buf.len) {
             const dest = try self.alloc.alloc(u8, new_len);
@@ -896,10 +896,10 @@ const Parser = struct {
         self.payload_buf_len = new_len;
     }
 
-    fn get_payload(self: *Self, buf: []const u8) ![]const u8 {
+    fn getPayload(self: *Self, buf: []const u8) ![]const u8 {
         if (self.payload_buf_len > 0) {
-            try self.push_payload(buf);
-            defer self.reset_payload_buf();
+            try self.pushPayload(buf);
+            defer self.resetPayloadBuf();
             if (self.payload_buf_owned) {
                 return self.payload_buf[0..self.payload_buf_len];
             }
@@ -908,7 +908,7 @@ const Parser = struct {
         return try self.alloc.dupe(u8, buf);
     }
 
-    fn reset_payload_buf(self: *Self) void {
+    fn resetPayloadBuf(self: *Self) void {
         self.payload_buf = scratch[0..];
         self.payload_buf_len = 0;
         self.payload_buf_owned = false;
@@ -924,13 +924,13 @@ test "parse INFO operation" {
     };
 
     for (valid) |buf, i| {
-        var op = try test_parse_buf(buf);
+        var op = try testParseBuf(buf);
         try expect(op.info.args.proto == i);
     }
 
     const unexpected_token = [_][]const u8{ "INFOO something\r\n", "INFO_ something\r\n", "INFOsomething\r\n", "-err\n" };
     for (unexpected_token) |buf| {
-        var err = test_parse_buf(buf);
+        var err = testParseBuf(buf);
         try expectError(OpParseError.UnexpectedToken, err);
     }
 
@@ -941,7 +941,7 @@ test "parse INFO operation" {
         "-err\t   \r",
     };
     for (missing_arguments) |buf| {
-        var err = test_parse_buf(buf);
+        var err = testParseBuf(buf);
         try expectError(OpParseError.MissingArguments, err);
     }
 }
@@ -973,7 +973,7 @@ const TestOpHandler = struct {
     }
 };
 
-fn test_parse_buf(buf: []const u8) !Op {
+fn testParseBuf(buf: []const u8) !Op {
     var handler: TestOpHandler = TestOpHandler.init();
     defer handler.deinit();
     var parser = Parser.init(testing.allocator, &OpHandler.init(&handler));
@@ -988,7 +988,7 @@ test "parse PING operation" {
         "ping     \n",
     };
     for (pings) |buf| {
-        var op = try test_parse_buf(buf);
+        var op = try testParseBuf(buf);
         try expect(op == .ping);
     }
 }
@@ -1000,7 +1000,7 @@ test "parse PONG operation" {
         "pong     \n",
     };
     for (pongs) |buf| {
-        var op = try test_parse_buf(buf);
+        var op = try testParseBuf(buf);
         try expect(op == .pong);
     }
 }
@@ -1012,7 +1012,7 @@ test "parse ERR operation" {
         "-eRr\t'Permissions Violation for Subscription to foo.bar'\n",
     };
     for (errs) |buf, i| {
-        var op = try test_parse_buf(buf);
+        var op = try testParseBuf(buf);
         try expect(op == .err);
         switch (i) {
             0 => try expect(mem.eql(u8, "'Stale Connection'", op.err.desc)),
@@ -1075,7 +1075,7 @@ test "split buffer scenarios" {
 
         try parser.parse(cr_lf); // finish
         var op = handler.last();
-        try assert_info_args(op.info.args);
+        try assertInfoArgs(op.info.args);
         op.deinit();
     }
 }
