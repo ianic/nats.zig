@@ -17,7 +17,7 @@ pub fn main() !void {
     var nc = try nats.connect(alloc);
     defer nc.deinit();
 
-    try loop.runDetached(alloc, nats.Conn.run, .{&nc});
+    try loop.runDetached(alloc, nats.run, .{&nc});
 
     var handler = Handler{ .nc = &nc, .sid = 0 };
     handler.sid = try nc.subscribe("foo", &nats.MsgHandler.init(&handler));
