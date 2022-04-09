@@ -60,7 +60,7 @@ pub const Conn = struct {
     }
 
     fn loop(self: *Conn) !void {
-        var parser = Parser{ .alloc = testing.allocator, .handler = &OpHandler.init(self) };
+        var parser = Parser.init(self.allocator, &OpHandler.init(self));
 
         var buf: [conn_read_buffer_size]u8 = undefined;
         while (true) {
@@ -568,7 +568,7 @@ pub const OpHandler = struct {
 
 // reads operations from the underlying reader in chunks
 // calls handler for each parsed operation
-pub const Parser = struct {
+const Parser = struct {
     var scratch: [max_args_len]u8 = undefined;
 
     handler: *OpHandler,
@@ -587,7 +587,11 @@ pub const Parser = struct {
 
     const Self = @This();
 
-    pub fn parse(self: *Self, buf: []const u8) !void {
+    fn init(alloc: Allocator, handler: *OpHandler) Parser {
+        return .{ .alloc = alloc, .handler = handler };
+    }
+
+    fn parse(self: *Self, buf: []const u8) !void {
         var args_start: usize = 0;
         var drop: usize = 0;
 
@@ -972,7 +976,7 @@ const TestOpHandler = struct {
 fn test_parse_buf(buf: []const u8) !Op {
     var handler: TestOpHandler = TestOpHandler.init();
     defer handler.deinit();
-    var parser = Parser{ .alloc = testing.allocator, .handler = &OpHandler.init(&handler) };
+    var parser = Parser.init(testing.allocator, &OpHandler.init(&handler));
     try parser.parse(buf);
     return handler.last();
 }
@@ -1023,7 +1027,7 @@ test "parse ERR operation" {
 test "args line too long" {
     var handler: TestOpHandler = TestOpHandler.init();
     defer handler.deinit();
-    var parser = Parser{ .alloc = testing.allocator, .handler = &OpHandler.init(&handler) };
+    var parser = Parser.init(testing.allocator, &OpHandler.init(&handler));
 
     var max_line = std.ArrayList(u8).init(testing.allocator);
     defer max_line.deinit();
@@ -1050,7 +1054,7 @@ test "args line too long" {
 test "split buffer scenarios" {
     var handler: TestOpHandler = TestOpHandler.init();
     defer handler.deinit();
-    var parser = Parser{ .alloc = testing.allocator, .handler = &OpHandler.init(&handler) };
+    var parser = Parser.init(testing.allocator, &OpHandler.init(&handler));
 
     var sizes = [_]usize{ 2, 3, 5, 8, 13, 21, 34, 55, 89, 144 };
     for (sizes) |size| {
@@ -1079,7 +1083,7 @@ test "split buffer scenarios" {
 test "MSG with different payload sizes" {
     var handler: TestOpHandler = TestOpHandler.init();
     defer handler.deinit();
-    var parser = Parser{ .alloc = testing.allocator, .handler = &OpHandler.init(&handler) };
+    var parser = Parser.init(testing.allocator, &OpHandler.init(&handler));
 
     var buf: [1024]u8 = undefined;
     var i: usize = 1;

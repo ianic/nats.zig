@@ -21,9 +21,7 @@ pub fn main() !void {
 
     var handler = Handler{ .nc = &nc, .sid = 0 };
     handler.sid = try nc.subscribe("foo", &nats.MsgHandler.init(&handler));
-    //defer nc.unSubscribe(sid) catch {};
 
-    defer print("exiting", .{});
     loop.run();
 }
 
