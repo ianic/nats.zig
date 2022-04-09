@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const nats = @import("nats");
 
 pub const io_mode = .evented;
+pub const event_loop_mode = .single_threaded;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -33,10 +34,8 @@ const Handler = struct {
     pub fn onMsg(self: *Handler, msg: nats.Msg) void {
         print("onMsg subject: {s}, data: {s}\n", .{ msg.subject, msg.data() });
         self.msgs_count += 1;
-        if (self.msgs_count >= 10) {
-            nosuspend {
-                self.nc.unSubscribe(self.sid) catch {};
-            }
+        if (self.msgs_count >= 2) {
+            self.nc.unSubscribe(self.sid) catch {};
         }
     }
 };

@@ -5,7 +5,6 @@ const net = std.net;
 const fmt = std.fmt;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
-const bufferStream = std.io.fixedBufferStream;
 
 // testing imports
 const testing = std.testing;
@@ -21,6 +20,7 @@ const empty_str = ([_]u8{})[0..]; // TODO check this empty string idea, trying t
 const cr_lf = "\r\n";
 const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
 const pong_op = "PONG\r\n";
+const ping_op = "PING\r\n";
 
 pub fn connect(alloc: Allocator) !Conn {
     return try Conn.connect(alloc);
@@ -30,27 +30,80 @@ pub fn run(conn: *Conn) void {
     conn.run();
 }
 
-pub const Conn = struct {
-    stream: std.net.Stream,
-    scratch: [max_args_len]u8 = undefined,
+const ConnectError = error{
+    HandshakeFailed,
+    ServerError,
+};
 
+pub const Conn = struct {
+    alloc: Allocator,
+    stream: net.Stream,
+    scratch: [max_args_len]u8 = undefined,
     ssid: u64 = 0,
-    subs: std.AutoHashMap(u64, Subscription),
+    subs: std.AutoHashMap(u64, Subscription) = undefined,
     op_builder: OpBuilder = OpBuilder{},
     err: anyerror = undefined,
-
-    alloc: Allocator,
+    err_op: ?OpErr = null,
+    info: Info = undefined,
 
     const Self = @This();
 
     pub fn connect(alloc: Allocator) !Conn {
         const addr = try net.Address.parseIp4("127.0.0.1", 4222);
         const stream = try net.tcpConnectToAddress(addr);
-        return Conn{
+        var conn = Conn{
             .stream = stream,
             .alloc = alloc,
-            .subs = std.AutoHashMap(u64, Subscription).init(alloc),
         };
+        errdefer stream.close();
+        try conn.connectHandshake();
+        conn.subs = std.AutoHashMap(u64, Subscription).init(alloc);
+        return conn;
+    }
+
+    fn connectHandshake(self: *Self) !void {
+        var handler = struct {
+            got_info: bool = false,
+            got_ok: bool = false,
+            got_pong: bool = false,
+            got_ping: bool = false,
+            info: Info = undefined,
+            fn onOp(h: *@This(), op: Op) void {
+                switch (op) {
+                    .info => |info| {
+                        h.got_info = true;
+                        h.info = info;
+                    },
+                    .ok => h.got_ok = true,
+                    .ping => h.got_ping = true,
+                    .pong => h.got_pong = true,
+                    else => {
+                        op.deinit();
+                    },
+                }
+            }
+        }{};
+        var parser = Parser.init(self.alloc, &OpHandler.init(&handler));
+        var buf: [max_args_len]u8 = undefined;
+
+        // expect INFO at start
+        var offset = try self.stream.read(buf[0..]);
+        try parser.parse(buf[0..offset]);
+        if (!handler.got_info) {
+            return ConnectError.HandshakeFailed;
+        }
+        self.info = handler.info;
+
+        // send CONNECT, PING
+        _ = try self.stream.write(connect_op);
+        _ = try self.stream.write(ping_op);
+
+        // expect PONG
+        offset = try self.stream.read(buf[0..]);
+        try parser.parse(buf[0..offset]);
+        if (!handler.got_pong) {
+            return ConnectError.HandshakeFailed;
+        }
     }
 
     pub fn run(self: *Conn) void {
@@ -60,12 +113,13 @@ pub const Conn = struct {
     }
 
     fn loop(self: *Conn) !void {
-        var parser = Parser.init(self.allocator, &OpHandler.init(self));
+        var parser = Parser.init(self.alloc, &OpHandler.init(self));
 
         var buf: [conn_read_buffer_size]u8 = undefined;
         while (true) {
             var bytes_read = try self.stream.read(buf[0..]);
             if (bytes_read == 0) {
+                //print("loop exit \n", .{});
                 return;
             }
             print("> {s}", .{buf[0..bytes_read]});
@@ -76,14 +130,15 @@ pub const Conn = struct {
     fn onOp(self: *Self, op: Op) void {
         self.onOpOpt(op) catch |err| {
             self.err = err;
-            // TODO break loop
+            self.stream.close(); // TODO is this stopping the loop
         };
     }
 
     fn onOpOpt(self: *Self, op: Op) !void {
         switch (op) {
-            .info => nosuspend {
-                try self.sendOp(connect_op);
+            .info => |info| {
+                self.info.deinit();
+                self.info = info;
             },
             .msg => |msg| {
                 if (self.subs.get(msg.sid)) |sub| {
@@ -91,9 +146,16 @@ pub const Conn = struct {
                 } else {
                     std.log.warn("no subscription for sid: {d}", .{msg.sid});
                 }
+                msg.deinit();
             },
             .ok => {},
-            .err => {},
+            .err => |e| {
+                self.err = ConnectError.ServerError;
+                if (self.err_op) |eo| {
+                    eo.deinit();
+                }
+                self.err_op = e;
+            },
             .ping => nosuspend {
                 try self.sendOp(pong_op);
             },
@@ -106,18 +168,20 @@ pub const Conn = struct {
         _ = try self.stream.write(buf);
     }
 
-    // just for pretty printing
     fn sendPayload(self: *Self, buf: []const u8) !void {
         print("  {s}\n", .{buf});
         _ = try self.stream.write(buf);
         _ = try self.stream.write(cr_lf);
     }
 
+    // publish message data on the subject
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
         try self.sendOp(self.op_builder.pubOp(subject, data.len));
         try self.sendPayload(data);
     }
 
+    // subscribes handler to the subject
+    // returns subscription id for use in unSubscribe
     pub fn subscribe(self: *Self, subject: []const u8, handler: *MsgHandler) !u64 {
         self.ssid += 1;
         var sid = self.ssid;
@@ -130,13 +194,25 @@ pub const Conn = struct {
         return sid;
     }
 
+    // use subscription id from subscribe to stop receiving messages
     pub fn unSubscribe(self: *Self, sid: u64) !void {
-        try self.sendOp(self.op_builder.unsub(sid));
-        _ = self.subs.remove(sid);
+        nosuspend {
+            try self.sendOp(self.op_builder.unsub(sid));
+            _ = self.subs.remove(sid);
+        }
+    }
+
+    pub fn close(self: *Self) void {
+        self.stream.close();
     }
 
     pub fn deinit(self: *Self) void {
-        self.stream.close();
+        //self.stream.close();
+        self.info.deinit();
+        self.subs.deinit();
+        if (self.err_op) |eo| {
+            eo.deinit();
+        }
     }
 };
 
@@ -263,8 +339,6 @@ fn parseMsgArgs(alloc: Allocator, buf: []const u8) !Msg {
         parts[part_no] = buf[start..];
         part_no += 1;
     }
-
-    //print("\nparts:{s}\n", .{parts});
 
     if (part_no == 3) {
         var sid = try fmt.parseUnsigned(u64, parts[1], 10);
@@ -703,7 +777,6 @@ const Parser = struct {
                             drop = 1;
                         },
                         '\n' => {
-                            //print("\n[{d}..{d}]", .{ args_start, i - drop });
                             try self.onInfo(buf[args_start .. i - drop]);
                             self.state = .start;
                         },

@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const nats = @import("nats");
 
 pub const io_mode = .evented;
+pub const event_loop_mode = .single_threaded;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
