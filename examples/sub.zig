@@ -2,13 +2,16 @@ const std = @import("std");
 const event = std.event;
 const nats = @import("nats");
 const info = std.log.info;
-
+const log = std.log;
 
 pub const io_mode = .evented;
 pub const event_loop_mode = .single_threaded;
 pub const log_level: std.log.Level = .info;
 
 pub fn main() !void {
+    // TODO it didn't exit without this
+    //defer std.os.exit(0);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -36,8 +39,9 @@ const Handler = struct {
         info("msg subject: '{s}', data: '{s}'", .{ msg.subject, msg.data() });
         self.msgs_count += 1;
         // unsubscribe example
-        // if (self.msgs_count >= 100) {
+        // if (self.msgs_count >= 2) {
         //     self.nc.unSubscribe(self.sid) catch {};
+        //     self.nc.close();
         // }
     }
 };
