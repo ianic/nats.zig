@@ -57,11 +57,11 @@ const Op = union(OpName) {
 
     hmsg,
 
-    fn deinit(op: Op) void {
+    fn deinit(op: Op, alloc: Allocator) void {
         switch (op) {
-            .info => op.info.deinit(),
-            .msg => op.msg.deinit(),
-            .err => op.err.deinit(),
+            .info => op.info.deinit(alloc),
+            .msg => op.msg.deinit(alloc),
+            .err => op.err.deinit(alloc),
             else => {},
         }
     }
@@ -73,15 +73,14 @@ pub const Msg = struct {
     reply: ?[]const u8,
     size: u64,
     payload: ?[]const u8 = null,
-    alloc: Allocator,
 
-    pub fn deinit(self: Msg) void {
-        self.alloc.free(self.subject);
+    pub fn deinit(self: Msg, alloc: Allocator) void {
+        alloc.free(self.subject);
         if (self.reply != null) {
-            self.alloc.free(self.reply.?);
+            alloc.free(self.reply.?);
         }
         if (self.payload != null) {
-            self.alloc.free(self.payload.?);
+            alloc.free(self.payload.?);
         }
     }
 
@@ -95,65 +94,63 @@ pub const Msg = struct {
 };
 
 const Info = struct {
-    const Args = struct {
-        // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#info
-        // https://github.com/nats-io/nats.go/blob/e076b0dcab3193b8d7cf41c1b747355ad1302170/nats.go#L687
-        server_id: []u8 = empty_str,
-        server_name: []u8 = empty_str,
-        proto: u32 = 1,
-        version: []u8 = empty_str,
-        host: []u8 = empty_str,
-        port: u32 = 4222,
+    // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#info
+    // https://github.com/nats-io/nats.go/blob/e076b0dcab3193b8d7cf41c1b747355ad1302170/nats.go#L687
+    server_id: []u8 = empty_str,
+    server_name: []u8 = empty_str,
+    proto: u32 = 1,
+    version: []u8 = empty_str,
+    host: []u8 = empty_str,
+    port: u32 = 4222,
 
-        headers: bool = false,
-        auth_required: bool = false,
-        tls_required: bool = false,
-        tls_available: bool = false,
+    headers: bool = false,
+    auth_required: bool = false,
+    tls_required: bool = false,
+    tls_available: bool = false,
 
-        max_payload: u64 = 1048576,
-        client_id: u64 = 0,
-        client_ip: []u8 = empty_str,
+    max_payload: u64 = 1048576,
+    client_id: u64 = 0,
+    client_ip: []u8 = empty_str,
 
-        nonce: []u8 = empty_str,
-        cluster: []u8 = empty_str,
-        connect_urls: [][]u8 = ([_][]u8{})[0..],
+    nonce: []u8 = empty_str,
+    cluster: []u8 = empty_str,
+    connect_urls: [][]u8 = ([_][]u8{})[0..],
 
-        ldm: bool = false,
-        jetstream: bool = false,
-    };
-
-    args: Args,
-    alloc: Allocator,
+    ldm: bool = false,
+    jetstream: bool = false,
 
     fn jsonParse(alloc: Allocator, buf: []const u8) !Info {
         // fixing error: evaluation exceeded 1000 backwards branches
         // ref: https://github.com/ziglang/zig/issues/9728
         @setEvalBranchQuota(1024 * 8);
         var stream = std.json.TokenStream.init(buf);
-        var args = try std.json.parse(Args, &stream, .{
+        var info = try std.json.parse(Info, &stream, .{
             .allocator = alloc,
             .ignore_unknown_fields = true,
             //.allow_trailing_data = true,
         });
-        return Info{
-            .alloc = alloc,
-            .args = args,
-        };
+        return info;
     }
 
-    fn deinit(self: Info) void {
-        std.json.parseFree(Args, self.args, .{
-            .allocator = self.alloc,
+    fn deinit(self: Info, alloc: Allocator) void {
+        std.json.parseFree(Info, self, .{
+            .allocator = alloc,
         });
     }
 };
 
+test "decode server info operation JSON args into Info struct" {
+    var alloc = std.testing.allocator;
+    var info = try Info.jsonParse(alloc, test_info_op);
+    defer info.deinit(alloc);
+    try assertInfoArgs(info);
+}
+
 const OpErr = struct {
     desc: []const u8,
-    alloc: Allocator,
 
-    fn deinit(self: OpErr) void {
-        self.alloc.free(self.desc);
+    fn deinit(self: OpErr, alloc: Allocator) void {
+        alloc.free(self.desc);
     }
 };
 
@@ -529,7 +526,7 @@ fn onInfo(self: *Self, buf: []const u8) !Op {
 
 fn onErr(self: *Self, buf: []const u8) !Op {
     var desc = try self.alloc.dupe(u8, try self.getArgs(buf));
-    var oe = OpErr{ .desc = desc, .alloc = self.alloc };
+    var oe = OpErr{ .desc = desc };
     return Op{ .err = oe };
 }
 
@@ -589,6 +586,10 @@ fn resetPayloadBuf(self: *Self) void {
     self.payload_buf_owned = false;
 }
 
+fn deinitOp(self: *Self, op: Op) void {
+    op.deinit(self.alloc);
+}
+
 test "buffer not consumed" {
     var parser = init(testing.allocator);
     try parser.push(" ");
@@ -608,7 +609,7 @@ test "INFO operation" {
     for (valid) |buf, i| {
         try parser.push(buf);
         const op = (try parser.next()).?;
-        try expect(op.info.args.proto == i);
+        try expect(op.info.proto == i);
     }
 }
 
@@ -682,7 +683,7 @@ test "ERR operation" {
             2 => try expect(mem.eql(u8, "'Permissions Violation for Subscription to foo.bar'", op.err.desc)),
             else => {},
         }
-        op.deinit();
+        parser.deinitOp(op);
     }
 }
 
@@ -701,7 +702,7 @@ test "max args line" {
     try parser.push(cr_lf);
     const op = (try parser.next()).?;
     try expect(op == .err);
-    op.deinit();
+    parser.deinitOp(op);
 }
 
 test "args line too long" {
@@ -744,8 +745,8 @@ test "split buffer scenarios" {
 
         try parser.push(cr_lf); // finish
         const op = (try parser.next()).?;
-        try assertInfoArgs(op.info.args);
-        op.deinit();
+        try assertInfoArgs(op.info);
+        parser.deinitOp(op);
     }
 }
 
@@ -753,7 +754,7 @@ const test_info_op =
     \\{"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
 ;
 
-fn assertInfoArgs(args: Info.Args) !void {
+fn assertInfoArgs(args: Info) !void {
     try expect(mem.eql(u8, "id", args.server_id));
     try expect(mem.eql(u8, "name", args.server_name));
     try expect(mem.eql(u8, "2.8.0", args.version));
@@ -790,7 +791,7 @@ test "MSG with different payload sizes" {
         try expect(mem.eql(u8, "subject", op.msg.subject));
         try expectEqual(i, op.msg.size);
         try expectEqual(i, op.msg.payload.?.len);
-        op.deinit();
+        parser.deinitOp(op);
     }
 }
 
@@ -837,7 +838,6 @@ fn parseMsgArgs(alloc: Allocator, buf: []const u8) !Msg {
             .sid = sid,
             .reply = null,
             .size = size,
-            .alloc = alloc,
         };
     }
     if (part_no == 4) {
@@ -850,33 +850,33 @@ fn parseMsgArgs(alloc: Allocator, buf: []const u8) !Msg {
             .sid = sid,
             .reply = try alloc.dupe(u8, parts[2]),
             .size = size,
-            .alloc = alloc,
         };
     }
     return OpParseError.UnexpectedMsgArgs;
 }
 
 test "parse msg args" {
-    var ma = try parseMsgArgs(testing.allocator, "foo.bar 9 11");
+    const alloc = testing.allocator;
+    var ma = try parseMsgArgs(alloc, "foo.bar 9 11");
     try expect(mem.eql(u8, ma.subject, "foo.bar"));
     try expect(ma.reply == null);
     try expectEqual(ma.sid, 9);
     try expectEqual(ma.size, 11);
-    ma.deinit();
+    ma.deinit(alloc);
 
     ma = try parseMsgArgs(testing.allocator, "bar.foo 10 INBOX.34 12");
     try expect(mem.eql(u8, ma.subject, "bar.foo"));
     try expect(mem.eql(u8, ma.reply.?, "INBOX.34"));
     try expectEqual(ma.sid, 10);
     try expectEqual(ma.size, 12);
-    ma.deinit();
+    ma.deinit(alloc);
 
     ma = try parseMsgArgs(testing.allocator, "bar.foo.bar    11\tINBOX.35           13 ");
     try expect(mem.eql(u8, ma.subject, "bar.foo.bar"));
     try expect(mem.eql(u8, ma.reply.?, "INBOX.35"));
     try expectEqual(ma.sid, 11);
     try expectEqual(ma.size, 13);
-    ma.deinit();
+    ma.deinit(alloc);
 
     const cases = [_][]const u8{
         "bar.foo 10 INBOX.34 extra.arg 12", // too many arguments
