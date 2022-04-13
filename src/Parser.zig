@@ -41,7 +41,7 @@ const OpName = enum {
     hmsg,
 };
 
-const Op = union(OpName) {
+pub const Op = union(OpName) {
     info: Info,
     msg: Msg,
     ok,
@@ -57,7 +57,7 @@ const Op = union(OpName) {
 
     hmsg,
 
-    fn deinit(op: Op, alloc: Allocator) void {
+    pub fn deinit(op: Op, alloc: Allocator) void {
         switch (op) {
             .info => op.info.deinit(alloc),
             .msg => op.msg.deinit(alloc),
@@ -93,7 +93,7 @@ pub const Msg = struct {
     }
 };
 
-const Info = struct {
+pub const Info = struct {
     // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#info
     // https://github.com/nats-io/nats.go/blob/e076b0dcab3193b8d7cf41c1b747355ad1302170/nats.go#L687
     server_id: []u8 = empty_str,
@@ -146,7 +146,7 @@ test "decode server info operation JSON args into Info struct" {
     try assertInfoArgs(info);
 }
 
-const OpErr = struct {
+pub const OpErr = struct {
     desc: []const u8,
 
     fn deinit(self: OpErr, alloc: Allocator) void {
@@ -154,7 +154,7 @@ const OpErr = struct {
     }
 };
 
-const OpParseError = error{
+pub const Error = error{
     UnexpectedToken,
     MissingArguments,
     UnexpectedMsgArgs,
@@ -162,7 +162,7 @@ const OpParseError = error{
     BufferNotConsumed,
 };
 
-const ParserState = enum {
+const State = enum {
     start,
     i,
     in,
@@ -200,7 +200,7 @@ const ParserState = enum {
 var scratch: [max_args_len]u8 = undefined;
 
 alloc: Allocator,
-state: ParserState = .start,
+state: State = .start,
 
 args_buf: []u8 = scratch[0..],
 args_buf_len: usize = 0,
@@ -232,7 +232,7 @@ pub fn push(self: *Self, buf: []const u8) !void {
         self.pos = 0;
         return;
     }
-    return OpParseError.BufferNotConsumed;
+    return Error.BufferNotConsumed;
 }
 
 fn readBufferConsumed(self: *Self) bool {
@@ -273,27 +273,27 @@ pub fn next(self: *Self) !?Op {
                     'M', 'm' => self.state = .m,
                     '-' => self.state = .minus,
                     '+' => self.state = .plus,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .p => {
                 switch (b) {
                     'I', 'i' => self.state = .pi,
                     'O', 'o' => self.state = .po,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .pi => {
                 switch (b) {
                     'N', 'n' => self.state = .pin,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .pin => {
                 switch (b) {
                     'G', 'g' => self.state = .ping,
 
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .ping => {
@@ -308,13 +308,13 @@ pub fn next(self: *Self) !?Op {
             .po => {
                 switch (b) {
                     'N', 'n' => self.state = .pon,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .pon => {
                 switch (b) {
                     'G', 'g' => self.state = .pong,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .pong => {
@@ -329,31 +329,31 @@ pub fn next(self: *Self) !?Op {
             .i => {
                 switch (b) {
                     'N', 'n' => self.state = .in,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .in => {
                 switch (b) {
                     'F', 'f' => self.state = .inf,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .inf => {
                 switch (b) {
                     'O', 'o' => self.state = .info,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .info => {
                 switch (b) {
                     ' ', '\t' => self.state = .info_,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .info_ => {
                 switch (b) {
                     ' ', '\t' => {},
-                    '\r', '\n' => return OpParseError.MissingArguments,
+                    '\r', '\n' => return Error.MissingArguments,
                     else => {
                         self.state = .info_args;
                         args_start = i;
@@ -376,19 +376,19 @@ pub fn next(self: *Self) !?Op {
             .minus => {
                 switch (b) {
                     'E', 'e' => self.state = .e,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .e => {
                 switch (b) {
                     'R', 'r' => self.state = .er,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .er => {
                 switch (b) {
                     'R', 'r' => self.state = .err,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .err => {
@@ -396,13 +396,13 @@ pub fn next(self: *Self) !?Op {
                     ' ', '\t' => {
                         self.state = .err_;
                     },
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .err_ => {
                 switch (b) {
                     ' ', '\t' => {},
-                    '\r', '\n' => return OpParseError.MissingArguments,
+                    '\r', '\n' => return Error.MissingArguments,
                     else => {
                         self.state = .err_args;
                         args_start = i;
@@ -425,13 +425,13 @@ pub fn next(self: *Self) !?Op {
             .plus => {
                 switch (b) {
                     'O', 'o' => self.state = .o,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .o => {
                 switch (b) {
                     'K', 'k' => self.state = .ok,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .ok => {
@@ -446,25 +446,25 @@ pub fn next(self: *Self) !?Op {
             .m => {
                 switch (b) {
                     'S', 's' => self.state = .ms,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .ms => {
                 switch (b) {
                     'G', 'g' => self.state = .msg,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .msg => {
                 switch (b) {
                     ' ', '\t' => self.state = .msg_,
-                    else => return OpParseError.UnexpectedToken,
+                    else => return Error.UnexpectedToken,
                 }
             },
             .msg_ => {
                 switch (b) {
                     ' ', '\t' => {},
-                    '\r', '\n' => return OpParseError.MissingArguments,
+                    '\r', '\n' => return Error.MissingArguments,
                     else => {
                         self.state = .msg_args;
                         args_start = i;
@@ -542,7 +542,7 @@ fn getArgs(self: *Self, buf: []const u8) ![]const u8 {
 
 fn pushArgs(self: *Self, buf: []const u8) !void {
     if (self.args_buf_len + buf.len > max_args_len) {
-        return OpParseError.ArgsTooLong;
+        return Error.ArgsTooLong;
     }
     mem.copy(u8, self.args_buf[self.args_buf_len .. self.args_buf_len + buf.len], buf);
     self.args_buf_len += buf.len;
@@ -594,7 +594,7 @@ test "buffer not consumed" {
     var parser = init(testing.allocator);
     try parser.push(" ");
     const err = parser.push(" ");
-    try expectError(OpParseError.BufferNotConsumed, err);
+    try expectError(Error.BufferNotConsumed, err);
 }
 
 test "INFO operation" {
@@ -619,7 +619,7 @@ test "INFO operation expect UnexpectedToken error" {
         var parser = init(testing.allocator);
         try parser.push(buf);
         var err = parser.next();
-        try expectError(OpParseError.UnexpectedToken, err);
+        try expectError(Error.UnexpectedToken, err);
     }
 }
 
@@ -634,7 +634,7 @@ test "INFO operation expect MissingArguments error" {
         var parser = init(testing.allocator);
         try parser.push(buf);
         var err = parser.next();
-        try expectError(OpParseError.MissingArguments, err);
+        try expectError(Error.MissingArguments, err);
     }
 }
 
@@ -715,7 +715,7 @@ test "args line too long" {
 
     try parser.push(too_long.items);
     const err = parser.next();
-    try expectError(OpParseError.ArgsTooLong, err);
+    try expectError(Error.ArgsTooLong, err);
 }
 
 test "split buffer scenarios" {
@@ -807,7 +807,7 @@ fn parseMsgArgs(alloc: Allocator, buf: []const u8) !Msg {
             ' ', '\t', '\r', '\n' => {
                 if (started) {
                     if (part_no > 3) {
-                        return OpParseError.UnexpectedMsgArgs;
+                        return Error.UnexpectedMsgArgs;
                     }
                     parts[part_no] = buf[start..i];
                     part_no += 1;
@@ -824,7 +824,7 @@ fn parseMsgArgs(alloc: Allocator, buf: []const u8) !Msg {
     }
     if (started) {
         if (part_no > 3) {
-            return OpParseError.UnexpectedMsgArgs;
+            return Error.UnexpectedMsgArgs;
         }
         parts[part_no] = buf[start..];
         part_no += 1;
@@ -852,7 +852,7 @@ fn parseMsgArgs(alloc: Allocator, buf: []const u8) !Msg {
             .size = size,
         };
     }
-    return OpParseError.UnexpectedMsgArgs;
+    return Error.UnexpectedMsgArgs;
 }
 
 test "parse msg args" {
@@ -884,7 +884,7 @@ test "parse msg args" {
     };
     for (cases) |case| {
         var err = parseMsgArgs(testing.allocator, case);
-        try expectError(OpParseError.UnexpectedMsgArgs, err);
+        try expectError(Error.UnexpectedMsgArgs, err);
     }
 
     const not_a_number_cases = [_][]const u8{
