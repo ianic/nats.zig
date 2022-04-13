@@ -132,7 +132,7 @@ pub const Info = struct {
         return info;
     }
 
-    fn deinit(self: Info, alloc: Allocator) void {
+    pub fn deinit(self: Info, alloc: Allocator) void {
         std.json.parseFree(Info, self, .{
             .allocator = alloc,
         });
@@ -149,7 +149,7 @@ test "decode server info operation JSON args into Info struct" {
 pub const OpErr = struct {
     desc: []const u8,
 
-    fn deinit(self: OpErr, alloc: Allocator) void {
+    pub fn deinit(self: OpErr, alloc: Allocator) void {
         alloc.free(self.desc);
     }
 };
@@ -160,6 +160,7 @@ pub const Error = error{
     UnexpectedMsgArgs,
     ArgsTooLong,
     BufferNotConsumed,
+    OpNotFound,
 };
 
 const State = enum {
@@ -216,22 +217,35 @@ read_buffer: []const u8 = empty_str,
 pos: usize = 0,
 args_start: usize = 0,
 drop: usize = 0,
+consumed: bool = true,
 
 pub fn init(alloc: Allocator) Self {
     return .{ .alloc = alloc };
+}
+
+pub fn readOp(self: *Self, buf: []const u8) !Op {
+    try self.push(buf);
+    const oop = try self.next();
+    if (oop) |op| {
+        return op;
+    }
+    return Error.OpNotFound;
 }
 
 // Push buffer to the parser.
 // Parse buffer one operation at the time by calling next
 // until next returns null.
 pub fn push(self: *Self, buf: []const u8) !void {
-    if (self.readBufferConsumed()) {
+    if (self.consumed) {
+        //print("setting buf '{s}'\n", .{buf});
         self.read_buffer = buf;
         self.args_start = 0;
         self.drop = 0;
         self.pos = 0;
+        self.consumed = false;
         return;
     }
+    //print("pos: {d} buf.len: {d} buf '{s}' new buf '{s}'\n", .{self.pos, self.read_buffer.len, self.read_buffer, buf});
     return Error.BufferNotConsumed;
 }
 
@@ -246,6 +260,11 @@ pub fn hasMore(self: *Self) bool {
     return !self.readBufferConsumed();
 }
 
+// objasni kako ovo radi
+// vraca error ako se parser raspadne
+// inace vraca op koji nadje
+// ili ako dodje do kraja buffera onda vrati null
+// od klijenta se ocekuje da nakon sto postavi buf zove next dok ne vrati null
 pub fn next(self: *Self) !?Op {
     const buf = self.read_buffer;
 
@@ -257,6 +276,7 @@ pub fn next(self: *Self) !?Op {
         self.args_start = args_start;
         self.drop = drop;
         self.pos = i;
+        self.consumed = self.readBufferConsumed();
     }
 
     while (i < buf.len) : (i += 1) {
@@ -292,7 +312,6 @@ pub fn next(self: *Self) !?Op {
             .pin => {
                 switch (b) {
                     'G', 'g' => self.state = .ping,
-
                     else => return Error.UnexpectedToken,
                 }
             },
