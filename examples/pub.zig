@@ -15,11 +15,10 @@ pub fn main() !void {
     var loop = event.Loop.instance.?;
     defer loop.deinit();
 
-    var nc = try nats.connect(alloc);
+    var nc = try nats.connect(alloc, loop);
     defer nc.deinit();
 
-    try loop.runDetached(alloc, nats.run, .{&nc});
-    try loop.runDetached(alloc, publish, .{&nc});
+    try loop.runDetached(alloc, publish, .{nc});
 
     loop.run();
 }

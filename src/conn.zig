@@ -4,6 +4,7 @@ const assert = std.debug.assert;
 const net = std.net;
 const fmt = std.fmt;
 const mem = std.mem;
+const event = std.event;
 const Allocator = std.mem.Allocator;
 
 // testing imports
@@ -22,12 +23,8 @@ const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required
 const pong_op = "PONG\r\n";
 const ping_op = "PING\r\n";
 
-pub fn connect(alloc: Allocator) !Conn {
-    return try Conn.connect(alloc);
-}
-
-pub fn run(conn: *Conn) void {
-    conn.run();
+pub fn connect(alloc: Allocator, loop: *event.Loop) !*Conn {
+    return try Conn.connect(alloc, loop);
 }
 
 const log = std.log.scoped(.nats);
@@ -56,25 +53,31 @@ pub const Conn = struct {
     stream: net.Stream,
     scratch: [max_args_len]u8 = undefined,
     ssid: u64 = 0,
-    subs: std.AutoHashMap(u64, Subscription) = undefined,
+    subs: std.AutoHashMap(u64, Subscription),
     op_builder: OpBuilder = OpBuilder{},
-    err: anyerror = undefined,
+    err: ?anyerror = null,
     err_op: ?OpErr = null,
-    info: Info = undefined,
+    info: ?Info = null,
 
     const Self = @This();
 
-    pub fn connect(alloc: Allocator) !Conn {
+    pub fn connect(alloc: Allocator, loop: *event.Loop) !*Conn {
+        if (!std.io.is_async) @compileError("Can't use in non-async mode!");
+
         const addr = try net.Address.parseIp4("127.0.0.1", 4222);
         const stream = try net.tcpConnectToAddress(addr);
+        errdefer stream.close();
 
-        var conn = Conn{
+        var conn = try alloc.create(Self);
+        conn.* = Conn{
             .stream = stream,
             .alloc = alloc,
+            .subs = std.AutoHashMap(u64, Subscription).init(alloc),
         };
-        errdefer stream.close();
+        errdefer conn.deinit();
+
         try conn.connectHandshake();
-        conn.subs = std.AutoHashMap(u64, Subscription).init(alloc);
+        try loop.runDetached(alloc, Conn.run, .{conn});
         return conn;
     }
 
@@ -126,13 +129,13 @@ pub const Conn = struct {
     }
 
     pub fn run(self: *Conn) void {
-        self.loop() catch |err| {
+        self.readLoop() catch |err| {
             log.debug("run error {s}", .{err});
             self.err = err;
         };
     }
 
-    fn loop(self: *Conn) !void {
+    fn readLoop(self: *Conn) !void {
         var parser = Parser.init(self.alloc, &OpHandler.init(self));
 
         var buf: [conn_read_buffer_size]u8 = undefined;
@@ -156,7 +159,9 @@ pub const Conn = struct {
     fn onOpOpt(self: *Self, op: Op) !void {
         switch (op) {
             .info => |info| {
-                self.info.deinit();
+                if (self.info) |in| {
+                    in.deinit();
+                }
                 self.info = info;
             },
             .msg => |msg| {
@@ -226,11 +231,14 @@ pub const Conn = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.info.deinit();
         self.subs.deinit();
+        if (self.info) |in| {
+            in.deinit();
+        }
         if (self.err_op) |eo| {
             eo.deinit();
         }
+        self.alloc.destroy(self);
     }
 };
 
