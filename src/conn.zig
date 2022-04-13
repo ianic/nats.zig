@@ -127,6 +127,7 @@ pub const Conn = struct {
 
     pub fn run(self: *Conn) void {
         self.loop() catch |err| {
+            log.debug("run error {s}", .{err});
             self.err = err;
         };
     }
@@ -134,9 +135,8 @@ pub const Conn = struct {
     fn loop(self: *Conn) !void {
         var parser = Parser.init(self.alloc, &OpHandler.init(self));
 
-        var i: usize = 0;
         var buf: [conn_read_buffer_size]u8 = undefined;
-        while (true) : (i += 1) {
+        while (true) {
             var bytes_read = try self.stream.read(buf[0..]);
             if (bytes_read == 0) {
                 return;
@@ -226,7 +226,6 @@ pub const Conn = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        //self.stream.close();
         self.info.deinit();
         self.subs.deinit();
         if (self.err_op) |eo| {
