@@ -1,7 +1,5 @@
 const std = @import("std");
-const print = std.debug.print;
 const assert = std.debug.assert;
-const net = std.net;
 const fmt = std.fmt;
 const mem = std.mem;
 const event = std.event;
@@ -14,11 +12,11 @@ const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const expectError = std.testing.expectError;
 
-// TODO: you are repeating some of them in conn file and here
-// constants
+// constants TODO: you are repeating some of them in conn file and here
 const max_args_len = 4096;
 const empty_str = ([_]u8{})[0..]; // TODO check this empty string idea, trying to avoid undefined
 const cr_lf = "\r\n";
+
 const Self = @This();
 
 // protocol operations

@@ -1,5 +1,4 @@
 const std = @import("std");
-const print = std.debug.print;
 const assert = std.debug.assert;
 const net = std.net;
 const fmt = std.fmt;
@@ -21,9 +20,8 @@ const expectEqualStrings = std.testing.expectEqualStrings;
 const expectError = std.testing.expectError;
 
 // constants
-const conn_read_buffer_size = 4096;
-const max_args_len = 4096;
-const empty_str = ([_]u8{})[0..]; // TODO check this empty string idea, trying to avoid undefined
+const conn_read_buffer_size = 32768; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/nats.go#L479
+const max_args_len = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
 const cr_lf = "\r\n";
 const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
 const pong_op = "PONG\r\n";
