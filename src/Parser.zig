@@ -514,6 +514,7 @@ pub fn next(self: *Self) !?Op {
                     var pbuf = buf[i..];
                     try self.pushPayload(pbuf);
                     self.payload_size -= pbuf.len;
+                    i = buf.len;
                     return null;
                 }
             },
@@ -605,6 +606,12 @@ fn resetPayloadBuf(self: *Self) void {
 
 fn deinitOp(self: *Self, op: Op) void {
     op.deinit(self.alloc);
+}
+
+pub fn deinit(self: Self) void {
+    if (self.msg != null) {
+        self.msg.?.deinit(self.alloc);
+    }
 }
 
 test "buffer not consumed" {
@@ -802,7 +809,12 @@ test "MSG with different payload sizes" {
         var offset = fmt.formatIntBuf(buf[0..], i, 10, .lower, .{});
         try expect((try parser.setNext(buf[0..offset])) == null);
         try expect((try parser.setNext(cr_lf)) == null);
-        const op = (try parser.setNext(buf[0..i])).?;
+        // split payload into two buffers
+        var j = i / 2;
+        if (j > 0) {
+            try expect((try parser.setNext(buf[0..j])) == null);
+        }
+        const op = (try parser.setNext(buf[j..i])).?;
 
         // assert operation
         try expect(mem.eql(u8, "subject", op.msg.subject));
