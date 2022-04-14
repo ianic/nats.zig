@@ -12,36 +12,28 @@ pub const log_level: std.log.Level = .info;
 const no_msgs: usize = 1024;
 
 pub fn main() !void {
-    defer {
-        log.warn("done", .{});
-        // TODO it didn't exit without this
-        std.os.exit(0);
-    }
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var loop = event.Loop.instance.?;
-    defer loop.deinit();
-
-    var nc = try nats.connect(alloc, loop);
+    var nc = try nats.connect(alloc);
     defer nc.deinit();
+    var nc_frame = async nc.run();
 
     var subscriber = Subscriber{ .nc = nc, .sid = 0 };
     subscriber.sid = try nc.subscribe("test", &nats.MsgHandler.init(&subscriber));
 
-    try loop.runDetached(alloc, publisher, .{nc});
+    try publisher(nc);
 
-    loop.run();
+    try await nc_frame;
 }
 
-fn publisher(nc: *nats.Conn) void {
+fn publisher(nc: *nats.Conn) !void {
     var scratch: [no_msgs]u8 = undefined;
 
     var i: usize = 0;
     while (i<no_msgs) : (i += 1) {
-        nc.publish("test", scratch[0..i]) catch unreachable;
+        try nc.publish("test", scratch[0..i]);
     }
 }
 

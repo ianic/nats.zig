@@ -3,21 +3,20 @@ const assert = std.debug.assert;
 const net = std.net;
 const fmt = std.fmt;
 const mem = std.mem;
-const event = std.event;
 const Allocator = std.mem.Allocator;
 
 const Parser = @import("Parser.zig");
-const Op = @import("Parser.zig").Op;
-pub const Msg = @import("Parser.zig").Msg;
-const Info = @import("Parser.zig").Info;
-const OpErr = @import("Parser.zig").OpErr;
+pub const Msg = Parser.Msg;
+const Op = Parser.Op;
+const Info = Parser.Info;
+const OpErr = Parser.OpErr;
 
 // testing imports
 const testing = std.testing;
-const expect = std.testing.expect;
-const expectEqual = std.testing.expectEqual;
-const expectEqualStrings = std.testing.expectEqualStrings;
-const expectError = std.testing.expectError;
+const expect = testing.expect;
+const expectEqual = testing.expectEqual;
+const expectEqualStrings = testing.expectEqualStrings;
+const expectError = testing.expectError;
 
 // constants
 const conn_read_buffer_size = 32768; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/nats.go#L479
@@ -26,39 +25,26 @@ const cr_lf = "\r\n";
 const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
 const pong_op = "PONG\r\n";
 const ping_op = "PING\r\n";
-
-pub fn connect(alloc: Allocator, loop: *event.Loop) !*Conn {
-    return try Conn.connect(alloc, loop);
-}
-
 const log = std.log.scoped(.nats);
-fn debugConnIn(buf: []const u8) void {
-    logProtocolOp(">", buf);
+
+pub fn connect(alloc: Allocator) !*Conn {
+    return try Conn.connect(alloc);
 }
 
-fn debugConnOut(buf: []const u8) void {
-    logProtocolOp("<", buf);
-}
-
-fn logProtocolOp(prefix: []const u8, buf: []const u8)void {
-    if (buf.len == 0) {
-        return;
-    }
-    var b = buf[0..];
-    if (buf[buf.len - 1] == '\n') {
-        b = buf[0..buf.len-1];
-    }
-    log.debug("{s} {s}", .{prefix, b});
-}
-
-const ConnectError = error{
+const Error = error{
     HandshakeFailed,
     ServerError,
-
+    EOF, // when no bytes are received on socket
     NotOpenForReading, // when socket is closed
 };
 
 pub const Conn = struct {
+    const Status = enum {
+        disconnected,
+        connected,
+        closed,
+    };
+
     alloc: Allocator,
     stream: net.Stream,
     scratch: [max_args_len]u8 = undefined,
@@ -68,12 +54,11 @@ pub const Conn = struct {
     err: ?anyerror = null,
     err_op: ?OpErr = null,
     info: ?Info = null,
+    status: Status = .disconnected,
 
     const Self = @This();
 
-    pub fn connect(alloc: Allocator, loop: *event.Loop) !*Conn {
-        if (!std.io.is_async) @compileError("Can't use in non-async mode!");
-
+    fn connect(alloc: Allocator) !*Conn {
         const addr = try net.Address.parseIp4("127.0.0.1", 4222);
         const stream = try net.tcpConnectToAddress(addr);
         errdefer stream.close();
@@ -87,7 +72,6 @@ pub const Conn = struct {
         errdefer conn.deinit();
 
         try conn.connectHandshake();
-        try loop.runDetached(alloc, Conn.run, .{conn});
         return conn;
     }
 
@@ -101,7 +85,7 @@ pub const Conn = struct {
         debugConnIn(buf[0..offset]);
         var op = try parser.readOp(buf[0..offset]);
         if (op != .info) {
-            return ConnectError.HandshakeFailed;
+            return Error.HandshakeFailed;
         }
         self.info = op.info;
 
@@ -114,16 +98,22 @@ pub const Conn = struct {
         debugConnIn(buf[0..offset]);
         op = try parser.readOp(buf[0..offset]);
         if (op != .pong) {
-            return ConnectError.HandshakeFailed;
+            return Error.HandshakeFailed;
         }
+        self.status = .connected;
     }
 
-    fn run(self: *Conn) void {
+    pub fn run(self: *Conn) !void {
         self.readLoop() catch |err| {
-            if (err != ConnectError.NotOpenForReading) {
-                log.warn("run error {s}", .{err});
+            if (err == Error.NotOpenForReading and self.status == .closed) {
+                // this is expected error after closing stream in Conn.close()
+                return;
             }
-            self.err = err;
+            if (self.err_op != null) {
+                log.warn("run exit with last server ERR: {s}", .{self.err_op.?.desc});
+            }
+            log.warn("run error: {s}", .{err});
+            return;
         };
     }
 
@@ -135,7 +125,7 @@ pub const Conn = struct {
         while (true) {
             var bytes_read = try self.stream.read(buf[0..]);
             if (bytes_read == 0) {
-                return;
+                return Error.EOF;
             }
             debugConnIn(buf[0..bytes_read]);
             try parser.push(buf[0..bytes_read]);
@@ -165,15 +155,14 @@ pub const Conn = struct {
             },
             .ok => {},
             .err => |e| {
-                self.err = ConnectError.ServerError;
+                self.err = Error.ServerError;
                 if (self.err_op) |eo| {
                     eo.deinit(self.alloc);
                 }
+                log.warn("server ERR: {s}", .{e.desc});
                 self.err_op = e;
             },
-            .ping => nosuspend {
-                try self.sendOp(pong_op);
-            },
+            .ping => try self.sendOp(pong_op),
             else => {},
         }
     }
@@ -211,13 +200,12 @@ pub const Conn = struct {
 
     // use subscription id from subscribe to stop receiving messages
     pub fn unSubscribe(self: *Self, sid: u64) !void {
-        nosuspend {
-            try self.sendOp(self.op_builder.unsub(sid));
-            _ = self.subs.remove(sid);
-        }
+        try self.sendOp(self.op_builder.unsub(sid));
+        _ = self.subs.remove(sid);
     }
 
     pub fn close(self: *Self) void {
+        self.status = .closed;
         self.stream.close();
     }
 
@@ -317,4 +305,21 @@ pub const MsgHandler = struct {
     }
 };
 
+fn debugConnIn(buf: []const u8) void {
+    logProtocolOp(">", buf);
+}
 
+fn debugConnOut(buf: []const u8) void {
+    logProtocolOp("<", buf);
+}
+
+fn logProtocolOp(prefix: []const u8, buf: []const u8) void {
+    if (buf.len == 0) {
+        return;
+    }
+    var b = buf[0..];
+    if (buf[buf.len - 1] == '\n') {
+        b = buf[0 .. buf.len - 1];
+    }
+    log.debug("{s} {s}", .{ prefix, b });
+}

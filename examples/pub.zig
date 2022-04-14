@@ -12,23 +12,21 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var loop = event.Loop.instance.?;
-    defer loop.deinit();
-
-    var nc = try nats.connect(alloc, loop);
+    var nc = try nats.connect(alloc);
     defer nc.deinit();
+    var nc_frame = async nc.run();
 
-    try loop.runDetached(alloc, publish, .{nc});
+    try publish(nc);
 
-    loop.run();
+    try await nc_frame;
 }
 
-fn publish(nc: *nats.Conn) void {
+fn publish(nc: *nats.Conn) !void {
     var scratch: [128]u8 = undefined;
     var i: usize = 0;
     while (true) : (i += 1) {
         var buf = std.fmt.bufPrint(scratch[0..], "msg no {d}", .{i}) catch unreachable;
-        nc.publish("foo", buf) catch unreachable;
-        time.sleep(1000 * time.ns_per_ms);
+        try nc.publish("foo", buf);
+        time.sleep(100 * time.ns_per_ms);
     }
 }
