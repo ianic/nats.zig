@@ -92,8 +92,8 @@ pub const Conn = struct {
         self.info = op.info;
 
         // send CONNECT, PING
-        _ = try self.sendOp(connect_op);
-        _ = try self.sendOp(ping_op);
+        _ = try self.pubOp(connect_op);
+        _ = try self.pubOp(ping_op);
 
         // expect PONG
         offset = try self.stream.read(buf[0..]);
@@ -168,29 +168,32 @@ pub const Conn = struct {
                 log.warn("server ERR: {s}", .{e.desc});
                 self.err_op = e;
             },
-            .ping => try self.sendOp(pong_op),
+            .ping => try self.pubOp(pong_op),
             else => {},
         }
     }
 
-    fn sendOp(self: *Self, buf: []const u8) !void {
+    fn pubOp(self: *Self, buf: []const u8) !void {
+        {
+            var lock = self.writeLock.acquire();
+            defer lock.release();
+            _ = try self.stream.write(buf);
+        }
         debugConnOut(buf);
-        _ = try self.stream.write(buf);
-    }
-
-    fn sendPayload(self: *Self, buf: []const u8) !void {
-        debugConnOut(buf);
-        _ = try self.stream.write(buf);
-        _ = try self.stream.write(cr_lf);
     }
 
     // publish message data on the subject
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
-        var lock = self.writeLock.acquire();
-        defer lock.release();
-
-        try self.sendOp(self.op_builder.pubOp(subject, data.len));
-        try self.sendPayload(data);
+        var op_buf = self.op_builder.pubOp(subject, data.len);
+        {
+            var lock = self.writeLock.acquire();
+            defer lock.release();
+            _ = try self.stream.write(op_buf);
+            _ = try self.stream.write(data);
+            _ = try self.stream.write(cr_lf);
+        }
+        debugConnOut(op_buf);
+        debugConnOut(data);
     }
 
     // subscribes handler to the subject
@@ -211,13 +214,13 @@ pub const Conn = struct {
             _ = self.subs.remove(sid);
             lock.release();
         }
-        try self.sendOp(self.op_builder.sub(subject, sid));
+        try self.pubOp(self.op_builder.sub(subject, sid));
         return sid;
     }
 
     // use subscription id from subscribe to stop receiving messages
     pub fn unSubscribe(self: *Self, sid: u64) !void {
-        try self.sendOp(self.op_builder.unsub(sid));
+        try self.pubOp(self.op_builder.unsub(sid));
         const lock = self.subsLock.acquireWrite();
         _ = self.subs.remove(sid);
         lock.release();
