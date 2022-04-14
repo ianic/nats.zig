@@ -55,6 +55,8 @@ pub const Conn = struct {
     err_op: ?OpErr = null,
     info: ?Info = null,
     status: Status = .disconnected,
+    writeLock: std.event.Lock = .{},
+    subsLock: std.event.RwLock = std.event.RwLock.init(),
 
     const Self = @This();
 
@@ -146,7 +148,11 @@ pub const Conn = struct {
                 self.info = info;
             },
             .msg => |msg| {
-                if (self.subs.get(msg.sid)) |sub| {
+                const lock = self.subsLock.acquireRead();
+                var opt_sub = self.subs.get(msg.sid);
+                lock.release();
+
+                if (opt_sub) |sub| {
                     sub.handler.onMsg(msg);
                 } else {
                     std.log.warn("no subscription for sid: {d}", .{msg.sid});
@@ -180,6 +186,9 @@ pub const Conn = struct {
 
     // publish message data on the subject
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
+        var lock = self.writeLock.acquire();
+        defer lock.release();
+
         try self.sendOp(self.op_builder.pubOp(subject, data.len));
         try self.sendPayload(data);
     }
@@ -192,8 +201,16 @@ pub const Conn = struct {
         var sub = Subscription{
             .handler = handler,
         };
-        try self.subs.put(sid, sub);
-        errdefer _ = self.subs.remove(sid);
+        {
+            var lock = self.subsLock.acquireWrite();
+            defer lock.release();
+            try self.subs.put(sid, sub);
+        }
+        errdefer {
+            var lock = self.subsLock.acquireWrite();
+            _ = self.subs.remove(sid);
+            lock.release();
+        }
         try self.sendOp(self.op_builder.sub(subject, sid));
         return sid;
     }
@@ -201,7 +218,9 @@ pub const Conn = struct {
     // use subscription id from subscribe to stop receiving messages
     pub fn unSubscribe(self: *Self, sid: u64) !void {
         try self.sendOp(self.op_builder.unsub(sid));
+        const lock = self.subsLock.acquireWrite();
         _ = self.subs.remove(sid);
+        lock.release();
     }
 
     pub fn close(self: *Self) void {
@@ -210,6 +229,7 @@ pub const Conn = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.subsLock.deinit();
         self.subs.deinit();
         if (self.info) |in| {
             in.deinit(self.alloc);
