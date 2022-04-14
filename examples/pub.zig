@@ -16,12 +16,12 @@ pub fn main() !void {
     defer nc.deinit();
     var nc_frame = async nc.run();
 
-    try publish(nc);
+    try publisher(nc);
 
     try await nc_frame;
 }
 
-fn publish(nc: *nats.Conn) !void {
+fn publisher(nc: *nats.Conn) !void {
     var scratch: [128]u8 = undefined;
     var i: usize = 0;
     while (true) : (i += 1) {
