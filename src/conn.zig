@@ -33,23 +33,29 @@ pub fn connect(alloc: Allocator, loop: *event.Loop) !*Conn {
 
 const log = std.log.scoped(.nats);
 fn debugConnIn(buf: []const u8) void {
-    if (buf[buf.len - 1] == '\n') {
-        log.debug("> {s}", .{buf[0 .. buf.len - 1]});
-    } else {
-        log.debug("> {s}", .{buf[0..]});
-    }
+    logProtocolOp(">", buf);
 }
+
 fn debugConnOut(buf: []const u8) void {
-    if (buf[buf.len - 1] == '\n') {
-        log.debug("< {s}", .{buf[0 .. buf.len - 1]});
-    } else {
-        log.debug("< {s}", .{buf[0..]});
+    logProtocolOp("<", buf);
+}
+
+fn logProtocolOp(prefix: []const u8, buf: []const u8)void {
+    if (buf.len == 0) {
+        return;
     }
+    var b = buf[0..];
+    if (buf[buf.len - 1] == '\n') {
+        b = buf[0..buf.len-1];
+    }
+    log.debug("{s} {s}", .{prefix, b});
 }
 
 const ConnectError = error{
     HandshakeFailed,
     ServerError,
+
+    NotOpenForReading, // when socket is closed
 };
 
 pub const Conn = struct {
@@ -87,6 +93,7 @@ pub const Conn = struct {
 
     fn connectHandshake(self: *Self) !void {
         var parser = Parser.init(self.alloc);
+        defer parser.deinit();
         var buf: [max_args_len]u8 = undefined;
 
         // expect INFO at start
@@ -111,15 +118,18 @@ pub const Conn = struct {
         }
     }
 
-    pub fn run(self: *Conn) void {
+    fn run(self: *Conn) void {
         self.readLoop() catch |err| {
-            log.debug("run error {s}", .{err});
+            if (err != ConnectError.NotOpenForReading) {
+                log.warn("run error {s}", .{err});
+            }
             self.err = err;
         };
     }
 
     fn readLoop(self: *Conn) !void {
         var parser = Parser.init(self.alloc);
+        defer parser.deinit();
 
         var buf: [conn_read_buffer_size]u8 = undefined;
         while (true) {
@@ -132,12 +142,12 @@ pub const Conn = struct {
             while (try parser.next()) |op| {
                 // TODO rethink exit
                 //errdefer self.stream.close();
-                try self.onOpOpt(op);
+                try self.onOp(op);
             }
         }
     }
 
-    fn onOpOpt(self: *Self, op: Op) !void {
+    fn onOp(self: *Self, op: Op) !void {
         switch (op) {
             .info => |info| {
                 if (self.info) |in| {
@@ -306,3 +316,5 @@ pub const MsgHandler = struct {
         } };
     }
 };
+
+
