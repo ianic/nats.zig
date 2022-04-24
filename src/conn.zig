@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const net = std.net;
 const fmt = std.fmt;
 const mem = std.mem;
+const time = std.time;
 const Allocator = std.mem.Allocator;
 
 const Parser = @import("Parser.zig");
@@ -26,6 +27,7 @@ const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required
 const pong_op = "PONG\r\n";
 const ping_op = "PING\r\n";
 const log = std.log.scoped(.nats);
+const inbox_prefix = "_INBOX.";
 
 pub fn connect(alloc: Allocator) !*Conn {
     return try Conn.connect(alloc);
@@ -36,12 +38,14 @@ const Error = error{
     ServerError,
     EOF, // when no bytes are received on socket
     NotOpenForReading, // when socket is closed
+    RequestTimeout,
 };
 
 pub const Conn = struct {
     const Status = enum {
         disconnected,
         connected,
+        closing,
         closed,
     };
 
@@ -57,6 +61,8 @@ pub const Conn = struct {
     status: Status = .disconnected,
     writeLock: std.event.Lock = .{},
     subsLock: std.event.RwLock = std.event.RwLock.init(),
+    requests: std.AutoHashMap(u64, *Request),
+    //to_await: ?*@Frame(timeoutRequest) = null,
 
     const Self = @This();
 
@@ -70,6 +76,7 @@ pub const Conn = struct {
             .stream = stream,
             .alloc = alloc,
             .subs = std.AutoHashMap(u64, Subscription).init(alloc),
+            .requests = std.AutoHashMap(u64, *Request).init(alloc),
         };
         errdefer conn.deinit();
 
@@ -108,6 +115,7 @@ pub const Conn = struct {
     pub fn run(self: *Conn) !void {
         self.readLoop() catch |err| {
             if (err == Error.NotOpenForReading and self.status == .closed) {
+                log.debug("run exit", .{});
                 // this is expected error after closing stream in Conn.close()
                 return;
             }
@@ -125,7 +133,10 @@ pub const Conn = struct {
 
         var buf: [conn_read_buffer_size]u8 = undefined;
         while (true) {
+            log.debug("readLoop reading", .{});
             var bytes_read = try self.stream.read(buf[0..]);
+            log.debug("readLoop read {d}", .{bytes_read});
+
             if (bytes_read == 0) {
                 return Error.EOF;
             }
@@ -169,6 +180,12 @@ pub const Conn = struct {
                 self.err_op = e;
             },
             .ping => try self.pubOp(pong_op),
+            .pong => {
+                if (self.status == .closing) {
+                    self.status = .closed;
+                    self.stream.close();
+                }
+            },
             else => {},
         }
     }
@@ -182,9 +199,7 @@ pub const Conn = struct {
         debugConnOut(buf);
     }
 
-    // publish message data on the subject
-    pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
-        var op_buf = self.op_builder.pubOp(subject, data.len);
+    fn pubMsg(self: *Self, op_buf: []const u8, data: []const u8) !void {
         {
             var lock = self.writeLock.acquire();
             defer lock.release();
@@ -196,23 +211,29 @@ pub const Conn = struct {
         debugConnOut(data);
     }
 
+    // publish message data on the subject
+    pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
+        var op_buf = self.op_builder.pubOp(subject, data.len);
+        try self.pubMsg(op_buf, data);
+    }
+
     // subscribes handler to the subject
     // returns subscription id for use in unSubscribe
     pub fn subscribe(self: *Self, subject: []const u8, handler: *MsgHandler) !u64 {
+        var lock = self.subsLock.acquireWrite();
         self.ssid += 1;
         var sid = self.ssid;
         var sub = Subscription{
             .handler = handler,
         };
         {
-            var lock = self.subsLock.acquireWrite();
             defer lock.release();
             try self.subs.put(sid, sub);
         }
         errdefer {
-            var lock = self.subsLock.acquireWrite();
+            var elock = self.subsLock.acquireWrite();
             _ = self.subs.remove(sid);
-            lock.release();
+            elock.release();
         }
         try self.pubOp(self.op_builder.sub(subject, sid));
         return sid;
@@ -226,14 +247,93 @@ pub const Conn = struct {
         lock.release();
     }
 
-    pub fn close(self: *Self) void {
-        self.status = .closed;
-        self.stream.close();
+    pub fn request(self: *Self, subject: []const u8, data: []const u8) !Msg {
+        var reply = "_INBOX.foo";
+        var sid = try self.subscribe(reply, &MsgHandler.init(self));
+        var req = Request{
+            .frame = @frame(),
+            .msg = undefined,
+        };
+        try self.requests.put(sid, &req);
+        var op_buf = self.op_builder.req(subject, reply, data.len);
+        try self.pubMsg(op_buf, data);
+
+            //         var run_frame = try self.alloc.create(@Frame(timeoutRequest));
+            // run_frame.* = async self.timeoutRequest(sid);
+            // self.to_await = run_frame;
+
+        suspend {
+
+            // var loop = std.event.Loop.instance.?;
+            // try loop.runDetached(self.alloc, timeoutRequest, .{self, sid});
+        }
+        var opt_req = self.requests.get(sid);
+        if (opt_req) |r| {
+            try self.unSubscribe(sid);
+            _ = self.requests.remove(sid);
+            return r.msg;
+        }
+        return Error.RequestTimeout;
+    }
+
+    fn timeoutRequest(self: *Self, sid: u64) void {
+        time.sleep(1000 * time.ns_per_ms);
+        if (self.requests.get(sid)) |req| {
+            self.unSubscribe(sid) catch {};
+            _ = self.requests.remove(sid);
+            log.debug("timeout request {d}", .{sid});
+            resume req.frame;
+        } else {
+            log.debug("nothing to timeout request {d}", .{sid});
+            // if (self.to_await) |aw| {
+            //     self.alloc.destroy(aw);
+            //     self.to_await = null;
+            // }
+        }
+    }
+
+    // fn cancelRequest(self: *Self, sid: u64) void {
+    //     var opt_req = self.requests.get(sid);
+    //     if (opt_req) |req| {
+    //         self.unSubscribe(sid) catch {};
+    //         _ = self.requests.remove(sid);
+    //         resume req.frame;
+    //     }
+    // }
+
+    fn onMsg(self: *Self, msg: Msg) void {
+        var opt_req = self.requests.get(msg.sid);
+        if (opt_req) |req| {
+            req.msg = msg;
+            resume req.frame;
+        } else {
+            log.warn("no request found for sid: {d}", .{msg.sid});
+        }
+    }
+
+    pub fn close(self: *Self) !void {
+        self.status = .closing;
+        try self.pubOp(ping_op);
+
+        // self.status = .closed;
+        // self.stream.close();
+        // log.debug("closed", .{});
+
+        // if (self.to_await) |aw| {
+        //     log.debug("awaiting", .{});
+        //     await aw.*;
+        //     log.debug("awaited", .{});
+        //     self.alloc.destroy(aw);
+        //     self.to_await = null;
+        // }
+
+        //self.pubOp(ping_op) catch {};
     }
 
     pub fn deinit(self: *Self) void {
         self.subsLock.deinit();
         self.subs.deinit();
+        self.requests.deinit();
         if (self.info) |in| {
             in.deinit(self.alloc);
         }
@@ -241,11 +341,23 @@ pub const Conn = struct {
             eo.deinit(self.alloc);
         }
         self.alloc.destroy(self);
+
     }
 };
 
+// fn waitRequest(nc: *Conn, sid: u64) void{
+//     time.sleep(1000 * time.ns_per_ms);
+//     nc.cancelRequest(sid);
+//     log.debug("done", .{});
+// }
+
 const Subscription = struct {
     handler: *MsgHandler,
+};
+
+const Request = struct {
+    frame: anyframe,
+    msg: Msg,
 };
 
 const OpBuilder = struct {
@@ -291,6 +403,24 @@ const OpBuilder = struct {
         offset += 2;
         return buf[0..offset];
     }
+
+    fn req(self: *Self, subject: []const u8, reply: []const u8, size: u64) []const u8 {
+        var buf = self.scratch[0..];
+        mem.copy(u8, buf[0..], "PUB ");
+        var offset: usize = 4;
+        mem.copy(u8, buf[offset..], subject);
+        offset += subject.len;
+        mem.copy(u8, buf[offset..], " ");
+        offset += 1;
+        mem.copy(u8, buf[offset..], reply);
+        offset += reply.len;
+        mem.copy(u8, buf[offset..], " ");
+        offset += 1;
+        offset += fmt.formatIntBuf(self.scratch[offset..], size, 10, .lower, .{});
+        mem.copy(u8, buf[offset..], cr_lf);
+        offset += 2;
+        return buf[0..offset];
+    }
 };
 
 test "operation builder" {
@@ -299,6 +429,7 @@ test "operation builder" {
     try expectEqualStrings("UNSUB 1234\r\n", ob.unsub(1234));
     try expectEqualStrings("SUB foo.bar 4567\r\n", ob.sub("foo.bar", 4567));
     try expectEqualStrings("PUB foo.bar 8901\r\n", ob.pubOp("foo.bar", 8901));
+    try expectEqualStrings("PUB foo.bar reply 2345\r\n", ob.req("foo.bar", "reply", 2345));
 }
 
 // ref: https://revivalizer.xyz/post/the-missing-zig-polymorphism-reference/

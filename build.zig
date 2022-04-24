@@ -20,6 +20,7 @@ pub fn build(b: *std.build.Builder) void {
     inline for (.{
         "pub",
         "sub",
+        "req",
         "test",
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");

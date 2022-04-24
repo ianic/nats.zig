@@ -16,19 +16,20 @@ pub fn main() !void {
     defer nc.deinit();
     var nc_frame = async nc.run();
 
-    try publish(nc);
+    var msg = try nc.request("foo.svc", "iso medo u ducan nije reko dobar dan");
+    std.log.debug("response received {s}", .{msg.data()});
+        //msg.deinit(alloc);
 
+    // _ = nc.request("foo.svc1", "iso medo u ducan nije reko dobar dan") catch |err| {
+    //     std.log.warn("error {}", .{err});
+    // };
+
+    std.time.sleep(1000 * time.ns_per_ms);
+
+    std.log.debug("close 1", .{});
     try nc.close();
+    std.log.debug("close 2", .{});
     try await nc_frame;
+    std.log.debug("close 3", .{});
 }
 
-fn publish(nc: *nats.Conn) !void {
-    var scratch: [128]u8 = undefined;
-    var i: usize = 0;
-    while (i<10) : (i += 1) {
-        var buf = std.fmt.bufPrint(scratch[0..], "msg no {d}", .{i}) catch unreachable;
-        try nc.publish("foo", buf);
-        //time.sleep(100 * time.ns_per_ms);
-        //std.os.nanosleep(0, 100 * time.ns_per_ms);
-    }
-}
