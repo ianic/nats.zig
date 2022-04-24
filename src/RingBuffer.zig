@@ -45,9 +45,10 @@ pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
     };
 }
 
+/// tests
+
 const expectEqual = std.testing.expectEqual;
 const time = std.time;
-//const print = std.debug.print;
 
 test "non blocking" {
     var rb = RingBuffer(u8, 2){};
@@ -94,10 +95,8 @@ const TestWriter = struct {
     rb: *TestRingBuffer,
     sleep: usize = 0,
     fn loop(self: *@This()) void {
-        //print("starting writer loop\n", .{});
         var i: u8 = 0;
         while (i < 100) : (i += 1) {
-            //print("push: {d}\n", .{i});
             if (self.sleep > 0) {
                 time.sleep(self.sleep * time.ns_per_ms);
             }
@@ -111,10 +110,8 @@ const TestReader = struct {
     sleep: usize = 0,
     last_val: u8 = 0,
     fn loop(self: *@This()) void {
-        //print("starting reader loop\n", .{});
         while (true) {
             var val = self.rb.get();
-            //print("read: {d}\n", .{val});
             if (self.sleep > 0) {
                 time.sleep(self.sleep * time.ns_per_ms);
             }
