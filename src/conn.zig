@@ -62,7 +62,6 @@ pub const Conn = struct {
     writeLock: std.event.Lock = .{},
     subsLock: std.event.RwLock = std.event.RwLock.init(),
     requests: std.AutoHashMap(u64, *Request),
-    //to_await: ?*@Frame(timeoutRequest) = null,
 
     const Self = @This();
 
@@ -257,11 +256,6 @@ pub const Conn = struct {
         try self.requests.put(sid, &req);
         var op_buf = self.op_builder.req(subject, reply, data.len);
         try self.pubMsg(op_buf, data);
-
-            //         var run_frame = try self.alloc.create(@Frame(timeoutRequest));
-            // run_frame.* = async self.timeoutRequest(sid);
-            // self.to_await = run_frame;
-
         suspend {
 
             // var loop = std.event.Loop.instance.?;
@@ -285,21 +279,8 @@ pub const Conn = struct {
             resume req.frame;
         } else {
             log.debug("nothing to timeout request {d}", .{sid});
-            // if (self.to_await) |aw| {
-            //     self.alloc.destroy(aw);
-            //     self.to_await = null;
-            // }
         }
     }
-
-    // fn cancelRequest(self: *Self, sid: u64) void {
-    //     var opt_req = self.requests.get(sid);
-    //     if (opt_req) |req| {
-    //         self.unSubscribe(sid) catch {};
-    //         _ = self.requests.remove(sid);
-    //         resume req.frame;
-    //     }
-    // }
 
     fn onMsg(self: *Self, msg: Msg) void {
         var opt_req = self.requests.get(msg.sid);
@@ -314,20 +295,6 @@ pub const Conn = struct {
     pub fn close(self: *Self) !void {
         self.status = .closing;
         try self.pubOp(ping_op);
-
-        // self.status = .closed;
-        // self.stream.close();
-        // log.debug("closed", .{});
-
-        // if (self.to_await) |aw| {
-        //     log.debug("awaiting", .{});
-        //     await aw.*;
-        //     log.debug("awaited", .{});
-        //     self.alloc.destroy(aw);
-        //     self.to_await = null;
-        // }
-
-        //self.pubOp(ping_op) catch {};
     }
 
     pub fn deinit(self: *Self) void {
@@ -344,12 +311,6 @@ pub const Conn = struct {
 
     }
 };
-
-// fn waitRequest(nc: *Conn, sid: u64) void{
-//     time.sleep(1000 * time.ns_per_ms);
-//     nc.cancelRequest(sid);
-//     log.debug("done", .{});
-// }
 
 const Subscription = struct {
     handler: *MsgHandler,
