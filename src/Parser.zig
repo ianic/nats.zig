@@ -609,6 +609,9 @@ fn deinitOp(self: *Self, op: Op) void {
 }
 
 pub fn deinit(self: Self) void {
+    if (self.payload_buf_owned) {
+        self.alloc.free(self.payload_buf);
+    }
     if (self.msg != null) {
         self.msg.?.deinit(self.alloc);
     }
