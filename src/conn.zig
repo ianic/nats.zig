@@ -1,9 +1,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const net = std.net;
+const net = std.x.net;
 const fmt = std.fmt;
 const mem = std.mem;
 const time = std.time;
+const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
 const Parser = @import("Parser.zig");
@@ -11,6 +12,8 @@ pub const Msg = Parser.Msg;
 const Op = Parser.Op;
 const Info = Parser.Info;
 const OpErr = Parser.OpErr;
+
+const RingBuffer = @import("RingBuffer.zig").RingBuffer;
 
 // testing imports
 const testing = std.testing;
@@ -22,6 +25,7 @@ const expectError = testing.expectError;
 // constants
 const conn_read_buffer_size = 32768; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/nats.go#L479
 const max_args_len = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
+const op_read_buffer_size = 1024;
 const cr_lf = "\r\n";
 const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
 const pong_op = "PONG\r\n";
@@ -39,6 +43,8 @@ const Error = error{
     EOF, // when no bytes are received on socket
     NotOpenForReading, // when socket is closed
     RequestTimeout,
+    MaxPayloadExceeded,
+    ConnectionResetByPeer,
 };
 
 pub const Conn = struct {
@@ -46,11 +52,13 @@ pub const Conn = struct {
         disconnected,
         connected,
         closing,
-        closed,
+        //closed,
     };
+    const ReadBuffer = RingBuffer(Op, op_read_buffer_size);
+    const OutBuffer = RingBuffer(Msg, op_read_buffer_size);
 
     alloc: Allocator,
-    stream: net.Stream,
+    client: net.tcp.Client,
     scratch: [max_args_len]u8 = undefined,
     ssid: u64 = 0,
     subs: std.AutoHashMap(u64, Subscription),
@@ -59,27 +67,32 @@ pub const Conn = struct {
     err_op: ?OpErr = null,
     info: ?Info = null,
     status: Status = .disconnected,
-    writeLock: std.event.Lock = .{},
-    subsLock: std.event.RwLock = std.event.RwLock.init(),
-    requests: std.AutoHashMap(u64, *Request),
+    mut: Thread.Mutex = Thread.Mutex{},
+    write_mut: Thread.Mutex = Thread.Mutex{},
+    read_buffer: ReadBuffer = ReadBuffer{},
+    reader_trd: Thread = undefined,
+    out_buffer: OutBuffer = OutBuffer{},
+    max_payload: u64 = 0,
 
     const Self = @This();
 
     fn connect(alloc: Allocator) !*Conn {
-        const addr = try net.Address.parseIp4("127.0.0.1", 4222);
-        const stream = try net.tcpConnectToAddress(addr);
-        errdefer stream.close();
+        const addr = net.ip.Address.initIPv4(try std.x.os.IPv4.parse("127.0.0.1"), 4222);
+        const client = try net.tcp.Client.init(.ip, .{ .close_on_exec = true });
+        try client.connect(addr);
+        errdefer client.deinit();
 
         var conn = try alloc.create(Self);
         conn.* = Conn{
-            .stream = stream,
+            .client = client,
             .alloc = alloc,
             .subs = std.AutoHashMap(u64, Subscription).init(alloc),
-            .requests = std.AutoHashMap(u64, *Request).init(alloc),
+            //.requests = std.AutoHashMap(u64, *Request).init(alloc),
         };
         errdefer conn.deinit();
 
         try conn.connectHandshake();
+        conn.reader_trd = try std.Thread.spawn(.{}, Self.reader, .{conn});
         return conn;
     }
 
@@ -89,20 +102,20 @@ pub const Conn = struct {
         var buf: [max_args_len]u8 = undefined;
 
         // expect INFO at start
-        var offset = try self.stream.read(buf[0..]);
+        var offset = try self.client.read(buf[0..], 0);
         debugConnIn(buf[0..offset]);
         var op = try parser.readOp(buf[0..offset]);
         if (op != .info) {
             return Error.HandshakeFailed;
         }
-        self.info = op.info;
+        self.onInfo(op.info);
 
         // send CONNECT, PING
         _ = try self.pubOp(connect_op);
         _ = try self.pubOp(ping_op);
 
         // expect PONG
-        offset = try self.stream.read(buf[0..]);
+        offset = try self.client.read(buf[0..], 0);
         debugConnIn(buf[0..offset]);
         op = try parser.readOp(buf[0..offset]);
         if (op != .pong) {
@@ -111,106 +124,142 @@ pub const Conn = struct {
         self.status = .connected;
     }
 
-    pub fn run(self: *Conn) !void {
+    fn reader(self: *Self) void {
         self.readLoop() catch |err| {
-            if (err == Error.NotOpenForReading and self.status == .closed) {
-                log.debug("run exit", .{});
-                // this is expected error after closing stream in Conn.close()
-                return;
+            if (!(err == Error.ConnectionResetByPeer and self.status == .closing)) {
+                log.err("reader error {}", .{err});
             }
-            if (self.err_op != null) {
-                log.warn("run exit with last server ERR: {s}", .{self.err_op.?.desc});
-            }
-            log.warn("run error: {s}", .{err});
-            return;
         };
+        self.read_buffer.close();
     }
 
-    fn readLoop(self: *Conn) !void {
+    fn readLoop(self: *Self) !void {
         var parser = Parser.init(self.alloc);
         defer parser.deinit();
 
         var buf: [conn_read_buffer_size]u8 = undefined;
         while (true) {
-            log.debug("readLoop reading", .{});
-            var bytes_read = try self.stream.read(buf[0..]);
-            log.debug("readLoop read {d}", .{bytes_read});
-
+            var bytes_read = try self.client.read(buf[0..], 0);
             if (bytes_read == 0) {
+                if (self.status == .closing) {
+                    return;
+                }
                 return Error.EOF;
             }
             debugConnIn(buf[0..bytes_read]);
             try parser.push(buf[0..bytes_read]);
             while (try parser.next()) |op| {
-                // TODO rethink exit
-                //errdefer self.stream.close();
-                try self.onOp(op);
+                self.read_buffer.put(op);
             }
         }
     }
 
-    fn onOp(self: *Self, op: Op) !void {
-        switch (op) {
-            .info => |info| {
-                if (self.info) |in| {
-                    in.deinit(self.alloc);
-                }
-                self.info = info;
-            },
-            .msg => |msg| {
-                const lock = self.subsLock.acquireRead();
-                var opt_sub = self.subs.get(msg.sid);
-                lock.release();
-
-                if (opt_sub) |sub| {
-                    sub.handler.onMsg(msg);
-                } else {
-                    std.log.warn("no subscription for sid: {d}", .{msg.sid});
-                }
-                msg.deinit(self.alloc);
-            },
-            .ok => {},
-            .err => |e| {
-                self.err = Error.ServerError;
-                if (self.err_op) |eo| {
-                    eo.deinit(self.alloc);
-                }
-                log.warn("server ERR: {s}", .{e.desc});
-                self.err_op = e;
-            },
-            .ping => try self.pubOp(pong_op),
-            .pong => {
-                if (self.status == .closing) {
-                    self.status = .closed;
-                    self.stream.close();
-                }
-            },
-            else => {},
+    pub fn read(self: *Self) ?Msg {
+        while (self.read_buffer.get()) |op| {
+            switch (op) {
+                .info => |info| self.onInfo(info),
+                .err => |err| self.onErr(err),
+                .msg => |msg| return msg,
+                .ping => self.pubOp(pong_op) catch {
+                    // TODO
+                },
+                .pong => {},
+                .ok => {},
+                else => {
+                    log.warn("unexpected operation {}", .{op});
+                },
+            }
         }
+        return null;
     }
+
+    fn onInfo(self: *Self, info: Info) void {
+        self.mut.lock();
+        defer self.mut.unlock();
+        if (self.info) |in| {
+            in.deinit(self.alloc);
+        }
+        self.info = info;
+        self.max_payload = info.max_payload;
+    }
+
+    fn onErr(self: *Self, err: OpErr) void {
+        self.mut.lock();
+        defer self.mut.unlock();
+        self.err = Error.ServerError;
+        if (self.err_op) |eo| {
+            eo.deinit(self.alloc);
+        }
+        log.warn("server ERR: {s}", .{err.desc});
+        self.err_op = err;
+    }
+
+    //fn onOp(self: *Self, op: Op) !void {}
+
+    // pub fn run(self: *Conn) !void {
+    //     self.readLoop() catch |err| {
+    //         if (err == Error.NotOpenForReading and self.status == .closed) {
+    //             log.debug("run exit", .{});
+    //             // this is expected error after closing stream in Conn.close()
+    //             return;
+    //         }
+    //         if (self.err_op != null) {
+    //             log.warn("run exit with last server ERR: {s}", .{self.err_op.?.desc});
+    //         }
+    //         log.warn("run error: {s}", .{err});
+    //         return;
+    //     };
+    // }
+
+    // fn readLoop(self: *Conn) !void {
+    //     var parser = Parser.init(self.alloc);
+    //     defer parser.deinit();
+
+    //     var buf: [conn_read_buffer_size]u8 = undefined;
+    //     while (true) {
+    //         log.debug("readLoop reading", .{});
+    //         var bytes_read = try self.client.read(buf[0..], 0);
+    //         log.debug("readLoop read {d}", .{bytes_read});
+
+    //         if (bytes_read == 0) {
+    //             return Error.EOF;
+    //         }
+    //         debugConnIn(buf[0..bytes_read]);
+    //         try parser.push(buf[0..bytes_read]);
+    //         while (try parser.next()) |op| {
+    //             // TODO rethink exit
+    //             //errdefer self.client.close();
+    //             try self.onOp(op);
+    //         }
+    //     }
+    // }
 
     fn pubOp(self: *Self, buf: []const u8) !void {
         {
-            var lock = self.writeLock.acquire();
-            defer lock.release();
-            _ = try self.stream.write(buf);
+            self.write_mut.lock();
+            defer self.write_mut.unlock();
+            _ = try self.client.write(buf, 0);
         }
         debugConnOut(buf);
     }
 
     fn pubMsg(self: *Self, op_buf: []const u8, data: []const u8) !void {
         {
-            var lock = self.writeLock.acquire();
-            defer lock.release();
-            _ = try self.stream.write(op_buf);
-            _ = try self.stream.write(data);
-            _ = try self.stream.write(cr_lf);
+            if (data.len > self.max_payload) {
+                return Error.MaxPayloadExceeded;
+            }
+            self.write_mut.lock();
+            defer self.write_mut.unlock();
+            _ = try self.client.write(op_buf, 0);
+            _ = try self.client.write(data, 0);
+            _ = try self.client.write(cr_lf, 0);
         }
         debugConnOut(op_buf);
         debugConnOut(data);
     }
 
     // publish message data on the subject
+    // data is not copied
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
         var op_buf = self.op_builder.pubOp(subject, data.len);
         try self.pubMsg(op_buf, data);
@@ -218,89 +267,91 @@ pub const Conn = struct {
 
     // subscribes handler to the subject
     // returns subscription id for use in unSubscribe
-    pub fn subscribe(self: *Self, subject: []const u8, handler: *MsgHandler) !u64 {
-        var lock = self.subsLock.acquireWrite();
+    pub fn subscribe(self: *Self, subject: []const u8) !u64 {
+        self.mut.lock();
+        defer self.mut.unlock();
+
         self.ssid += 1;
         var sid = self.ssid;
         var sub = Subscription{
-            .handler = handler,
+            .sid = sid,
         };
-        {
-            defer lock.release();
-            try self.subs.put(sid, sub);
-        }
+        try self.subs.put(sid, sub);
         errdefer {
-            var elock = self.subsLock.acquireWrite();
             _ = self.subs.remove(sid);
-            elock.release();
         }
         try self.pubOp(self.op_builder.sub(subject, sid));
         return sid;
     }
 
     // use subscription id from subscribe to stop receiving messages
-    pub fn unSubscribe(self: *Self, sid: u64) !void {
+    pub fn unsubscribe(self: *Self, sid: u64) !void {
+        self.mut.lock();
+        defer self.mut.unlock();
         try self.pubOp(self.op_builder.unsub(sid));
-        const lock = self.subsLock.acquireWrite();
         _ = self.subs.remove(sid);
-        lock.release();
     }
 
-    pub fn request(self: *Self, subject: []const u8, data: []const u8) !Msg {
-        var reply = "_INBOX.foo";
-        var sid = try self.subscribe(reply, &MsgHandler.init(self));
-        var req = Request{
-            .frame = @frame(),
-            .msg = undefined,
-        };
-        try self.requests.put(sid, &req);
-        var op_buf = self.op_builder.req(subject, reply, data.len);
-        try self.pubMsg(op_buf, data);
-        suspend {
+    // pub fn request(self: *Self, subject: []const u8, data: []const u8) !Msg {
+    //     var reply = "_INBOX.foo";
+    //     var sid = try self.subscribe(reply, &MsgHandler.init(self));
+    //     var req = Request{
+    //         .frame = @frame(),
+    //         .msg = undefined,
+    //     };
+    //     try self.requests.put(sid, &req);
+    //     var op_buf = self.op_builder.req(subject, reply, data.len);
+    //     try self.pubMsg(op_buf, data);
+    //     suspend {
 
-            // var loop = std.event.Loop.instance.?;
-            // try loop.runDetached(self.alloc, timeoutRequest, .{self, sid});
-        }
-        var opt_req = self.requests.get(sid);
-        if (opt_req) |r| {
-            try self.unSubscribe(sid);
-            _ = self.requests.remove(sid);
-            return r.msg;
-        }
-        return Error.RequestTimeout;
-    }
+    //         // var loop = std.event.Loop.instance.?;
+    //         // try loop.runDetached(self.alloc, timeoutRequest, .{self, sid});
+    //     }
+    //     var opt_req = self.requests.get(sid);
+    //     if (opt_req) |r| {
+    //         try self.unSubscribe(sid);
+    //         _ = self.requests.remove(sid);
+    //         return r.msg;
+    //     }
+    //     return Error.RequestTimeout;
+    // }
 
-    fn timeoutRequest(self: *Self, sid: u64) void {
-        time.sleep(1000 * time.ns_per_ms);
-        if (self.requests.get(sid)) |req| {
-            self.unSubscribe(sid) catch {};
-            _ = self.requests.remove(sid);
-            log.debug("timeout request {d}", .{sid});
-            resume req.frame;
-        } else {
-            log.debug("nothing to timeout request {d}", .{sid});
-        }
-    }
+    // fn timeoutRequest(self: *Self, sid: u64) void {
+    //     time.sleep(1000 * time.ns_per_ms);
+    //     if (self.requests.get(sid)) |req| {
+    //         self.unSubscribe(sid) catch {};
+    //         _ = self.requests.remove(sid);
+    //         log.debug("timeout request {d}", .{sid});
+    //         resume req.frame;
+    //     } else {
+    //         log.debug("nothing to timeout request {d}", .{sid});
+    //     }
+    // }
 
-    fn onMsg(self: *Self, msg: Msg) void {
-        var opt_req = self.requests.get(msg.sid);
-        if (opt_req) |req| {
-            req.msg = msg;
-            resume req.frame;
-        } else {
-            log.warn("no request found for sid: {d}", .{msg.sid});
-        }
-    }
+    // fn onMsg(self: *Self, msg: Msg) void {
+    //     var opt_req = self.requests.get(msg.sid);
+    //     if (opt_req) |req| {
+    //         req.msg = msg;
+    //         resume req.frame;
+    //     } else {
+    //         log.warn("no request found for sid: {d}", .{msg.sid});
+    //     }
+    // }
 
     pub fn close(self: *Self) !void {
         self.status = .closing;
-        try self.pubOp(ping_op);
+        try self.client.shutdown(.both);
+        std.Thread.join(self.reader_trd);
     }
 
     pub fn deinit(self: *Self) void {
-        self.subsLock.deinit();
+        if (self.status == .connected) {
+            self.close() catch {};
+        }
+        while (self.read_buffer.get()) |op| {
+            op.deinit(self.alloc);
+        }
         self.subs.deinit();
-        self.requests.deinit();
         if (self.info) |in| {
             in.deinit(self.alloc);
         }
@@ -308,12 +359,11 @@ pub const Conn = struct {
             eo.deinit(self.alloc);
         }
         self.alloc.destroy(self);
-
     }
 };
 
 const Subscription = struct {
-    handler: *MsgHandler,
+    sid: u64,
 };
 
 const Request = struct {
