@@ -4,6 +4,7 @@ const net = std.x.net;
 const fmt = std.fmt;
 const mem = std.mem;
 const time = std.time;
+const os = std.os;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
@@ -29,6 +30,23 @@ const log = std.log.scoped(.nats);
 
 pub fn connect(alloc: Allocator) !*Conn {
     return try Conn.connect(alloc);
+}
+
+var connToCloseOnTerm: ?*Conn = null;
+
+pub fn sigCloseHandler(_: c_int) callconv(.C) void {
+    if (connToCloseOnTerm) |nc| {
+        nc.close() catch {};
+    }
+}
+
+pub fn closeOnTerm(nc: *Conn) !void {
+    connToCloseOnTerm = nc;
+    try os.sigaction(os.SIG.INT, &os.Sigaction{
+        .handler = .{ .handler = sigCloseHandler },
+        .mask = os.empty_sigset,
+        .flags = 0,
+    }, null);
 }
 
 const Error = error{
@@ -116,12 +134,18 @@ pub const Conn = struct {
 
     fn reader(self: *Self) void {
         self.readLoop() catch |err| {
-            if (!(err == Error.ConnectionResetByPeer and self.status == .closing)) {
+            if (!(self.isClosed() and (err == Error.ConnectionResetByPeer or err == Error.EOF))) {
                 self.err = err;
-                log.err("reader error {}", .{err});
+                log.err("reader error: {}", .{err});
             }
         };
         self.read_buffer.close();
+    }
+
+    fn isClosed(self: *Self) bool {
+        self.mut.lock();
+        defer self.mut.unlock();
+        return self.status == .closing;
     }
 
     fn readLoop(self: *Self) !void {
@@ -151,14 +175,10 @@ pub const Conn = struct {
                 .info => |info| self.onInfo(info),
                 .err => |err| self.onErr(err),
                 .msg => |msg| return msg,
-                .ping => self.pubOp(pong_op) catch {
-                    // TODO
-                },
+                .ping => self.onPing(),
                 .pong => {},
                 .ok => {},
-                else => {
-                    log.warn("unexpected operation {}", .{op});
-                },
+                else => unreachable,
             }
         }
         return null;
@@ -183,6 +203,10 @@ pub const Conn = struct {
         }
         log.warn("server ERR: {s}", .{err.desc});
         self.err_op = err;
+    }
+
+    fn onPing(self: *Self) void {
+        self.pubOp(pong_op) catch {};
     }
 
     fn pubOp(self: *Self, buf: []const u8) !void {
@@ -240,10 +264,14 @@ pub const Conn = struct {
 
     // use subscription id from subscribe to stop receiving messages
     pub fn unsubscribe(self: *Self, sid: u64) !void {
+        if (self.isClosed()) {
+            return;
+        }
         try self.pubOp(self.op_builder.unsub(sid));
         self.mut.lock();
         defer self.mut.unlock();
         _ = self.subs.remove(sid);
+
     }
 
     // pub fn request(self: *Self, subject: []const u8, data: []const u8) !Msg {

@@ -2,7 +2,7 @@ const std = @import("std");
 const time = std.time;
 const nats = @import("nats");
 
-//pub const log_level: std.log.Level = .debug;
+//pub const log_level: std.log.Level = .info;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -14,10 +14,9 @@ pub fn main() !void {
 
     var scratch: [128]u8 = undefined;
     var i: u64 = 0;
-    while (i<10) : (i += 1) {
+    while (i < 10) : (i += 1) {
         var buf = std.fmt.bufPrint(scratch[0..], "msg no {d}", .{i}) catch unreachable;
-        try nc.publish("foo1", buf);
+        try nc.publish("foo", buf);
         time.sleep(100 * time.ns_per_ms);
     }
 }
-
