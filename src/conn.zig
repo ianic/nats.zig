@@ -15,13 +15,6 @@ const OpErr = Parser.OpErr;
 
 const RingBuffer = @import("RingBuffer.zig").RingBuffer;
 
-// testing imports
-const testing = std.testing;
-const expect = testing.expect;
-const expectEqual = testing.expectEqual;
-const expectEqualStrings = testing.expectEqualStrings;
-const expectError = testing.expectError;
-
 // constants
 const conn_read_buffer_size = 32768; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/nats.go#L479
 const max_args_len = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
@@ -30,8 +23,9 @@ const cr_lf = "\r\n";
 const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
 const pong_op = "PONG\r\n";
 const ping_op = "PING\r\n";
-const log = std.log.scoped(.nats);
 const inbox_prefix = "_INBOX.";
+
+const log = std.log.scoped(.nats);
 
 pub fn connect(alloc: Allocator) !*Conn {
     return try Conn.connect(alloc);
@@ -55,7 +49,7 @@ pub const Conn = struct {
         //closed,
     };
     const ReadBuffer = RingBuffer(Op, op_read_buffer_size);
-    const OutBuffer = RingBuffer(Msg, op_read_buffer_size);
+    const Self = @This();
 
     alloc: Allocator,
     client: net.tcp.Client,
@@ -71,10 +65,7 @@ pub const Conn = struct {
     write_mut: Thread.Mutex = Thread.Mutex{},
     read_buffer: ReadBuffer = ReadBuffer{},
     reader_trd: Thread = undefined,
-    out_buffer: OutBuffer = OutBuffer{},
     max_payload: u64 = 0,
-
-    const Self = @This();
 
     fn connect(alloc: Allocator) !*Conn {
         const addr = net.ip.Address.initIPv4(try std.x.os.IPv4.parse("127.0.0.1"), 4222);
@@ -87,12 +78,11 @@ pub const Conn = struct {
             .client = client,
             .alloc = alloc,
             .subs = std.AutoHashMap(u64, Subscription).init(alloc),
-            //.requests = std.AutoHashMap(u64, *Request).init(alloc),
         };
         errdefer conn.deinit();
 
         try conn.connectHandshake();
-        conn.reader_trd = try std.Thread.spawn(.{}, Self.reader, .{conn});
+        conn.reader_trd = try Thread.spawn(.{}, Self.reader, .{conn});
         return conn;
     }
 
@@ -127,6 +117,7 @@ pub const Conn = struct {
     fn reader(self: *Self) void {
         self.readLoop() catch |err| {
             if (!(err == Error.ConnectionResetByPeer and self.status == .closing)) {
+                self.err = err;
                 log.err("reader error {}", .{err});
             }
         };
@@ -194,46 +185,6 @@ pub const Conn = struct {
         self.err_op = err;
     }
 
-    //fn onOp(self: *Self, op: Op) !void {}
-
-    // pub fn run(self: *Conn) !void {
-    //     self.readLoop() catch |err| {
-    //         if (err == Error.NotOpenForReading and self.status == .closed) {
-    //             log.debug("run exit", .{});
-    //             // this is expected error after closing stream in Conn.close()
-    //             return;
-    //         }
-    //         if (self.err_op != null) {
-    //             log.warn("run exit with last server ERR: {s}", .{self.err_op.?.desc});
-    //         }
-    //         log.warn("run error: {s}", .{err});
-    //         return;
-    //     };
-    // }
-
-    // fn readLoop(self: *Conn) !void {
-    //     var parser = Parser.init(self.alloc);
-    //     defer parser.deinit();
-
-    //     var buf: [conn_read_buffer_size]u8 = undefined;
-    //     while (true) {
-    //         log.debug("readLoop reading", .{});
-    //         var bytes_read = try self.client.read(buf[0..], 0);
-    //         log.debug("readLoop read {d}", .{bytes_read});
-
-    //         if (bytes_read == 0) {
-    //             return Error.EOF;
-    //         }
-    //         debugConnIn(buf[0..bytes_read]);
-    //         try parser.push(buf[0..bytes_read]);
-    //         while (try parser.next()) |op| {
-    //             // TODO rethink exit
-    //             //errdefer self.client.close();
-    //             try self.onOp(op);
-    //         }
-    //     }
-    // }
-
     fn pubOp(self: *Self, buf: []const u8) !void {
         {
             self.write_mut.lock();
@@ -269,15 +220,18 @@ pub const Conn = struct {
     // returns subscription id for use in unSubscribe
     pub fn subscribe(self: *Self, subject: []const u8) !u64 {
         self.mut.lock();
-        defer self.mut.unlock();
-
         self.ssid += 1;
         var sid = self.ssid;
         var sub = Subscription{
             .sid = sid,
         };
-        try self.subs.put(sid, sub);
+        {
+            defer self.mut.unlock();
+            try self.subs.put(sid, sub);
+        }
         errdefer {
+            self.mut.lock();
+            defer self.mut.unlock();
             _ = self.subs.remove(sid);
         }
         try self.pubOp(self.op_builder.sub(subject, sid));
@@ -286,9 +240,9 @@ pub const Conn = struct {
 
     // use subscription id from subscribe to stop receiving messages
     pub fn unsubscribe(self: *Self, sid: u64) !void {
+        try self.pubOp(self.op_builder.unsub(sid));
         self.mut.lock();
         defer self.mut.unlock();
-        try self.pubOp(self.op_builder.unsub(sid));
         _ = self.subs.remove(sid);
     }
 
@@ -341,7 +295,7 @@ pub const Conn = struct {
     pub fn close(self: *Self) !void {
         self.status = .closing;
         try self.client.shutdown(.both);
-        std.Thread.join(self.reader_trd);
+        Thread.join(self.reader_trd);
     }
 
     pub fn deinit(self: *Self) void {
@@ -364,11 +318,6 @@ pub const Conn = struct {
 
 const Subscription = struct {
     sid: u64,
-};
-
-const Request = struct {
-    frame: anyframe,
-    msg: Msg,
 };
 
 const OpBuilder = struct {
@@ -434,6 +383,8 @@ const OpBuilder = struct {
     }
 };
 
+const expectEqualStrings = std.testing.expectEqualStrings;
+
 test "operation builder" {
     var ob = OpBuilder{};
 
@@ -442,33 +393,6 @@ test "operation builder" {
     try expectEqualStrings("PUB foo.bar 8901\r\n", ob.pubOp("foo.bar", 8901));
     try expectEqualStrings("PUB foo.bar reply 2345\r\n", ob.req("foo.bar", "reply", 2345));
 }
-
-// ref: https://revivalizer.xyz/post/the-missing-zig-polymorphism-reference/
-pub const MsgHandler = struct {
-    ptr: usize = undefined,
-    v_table: struct {
-        onMsg: fn (self: *MsgHandler, msg: Msg) void,
-    } = undefined,
-
-    pub fn onMsg(self: *MsgHandler, msg: Msg) void {
-        return self.v_table.onMsg(self, msg);
-    }
-
-    pub fn init(pointer: anytype) MsgHandler {
-        const Ptr = @TypeOf(pointer);
-        assert(@typeInfo(Ptr) == .Pointer); // Must be a pointer
-        assert(@typeInfo(Ptr).Pointer.size == .One); // Must be a single-item pointer
-        assert(@typeInfo(@typeInfo(Ptr).Pointer.child) == .Struct); // Must point to a struct
-
-        return MsgHandler{ .ptr = @ptrToInt(pointer), .v_table = .{
-            .onMsg = struct {
-                fn onMsg(self: *MsgHandler, msg: Msg) void {
-                    return @intToPtr(Ptr, self.ptr).onMsg(msg);
-                }
-            }.onMsg,
-        } };
-    }
-};
 
 fn debugConnIn(buf: []const u8) void {
     logProtocolOp(">", buf);

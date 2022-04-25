@@ -66,8 +66,8 @@ pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
     };
 }
 
-/// tests
 
+/// tests
 const expectEqual = std.testing.expectEqual;
 const time = std.time;
 
@@ -137,8 +137,8 @@ const TestReader = struct {
             if (self.sleep > 0) {
                 time.sleep(self.sleep * time.ns_per_ms);
             }
-            if (val>0) {
-                expectEqual(self.last_val+1, val) catch unreachable;
+            if (val > 0) {
+                expectEqual(self.last_val + 1, val) catch unreachable;
             }
             self.last_val = val;
             // if (val == 99) {
@@ -165,7 +165,7 @@ test "slow publisher" {
     var rb = TestRingBuffer{};
 
     var writer = TestWriter{ .rb = &rb, .sleep = 1 };
-    var reader = TestReader{ .rb = &rb};
+    var reader = TestReader{ .rb = &rb };
 
     var writer_trd = try Thread.spawn(.{}, TestWriter.loop, .{&writer});
     var reader_trd = try Thread.spawn(.{}, TestReader.loop, .{&reader});
