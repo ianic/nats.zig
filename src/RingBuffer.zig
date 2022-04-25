@@ -1,6 +1,11 @@
 const std = @import("std");
 const Thread = std.Thread;
 
+const State = enum {
+    open,
+    closed,
+};
+
 pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
     return struct {
         buffer: [buffer_size]T = undefined,
@@ -9,12 +14,17 @@ pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
         writer_cw: Thread.Condition = Thread.Condition{},
         reader_pos: u64 = 0,
         writer_pos: u64 = 0,
+        state: State = .open,
         const Self = @This();
 
-        pub fn get(self: *Self) T {
+        pub fn get(self: *Self) ?T {
             while (true) {
                 self.mut.lock();
                 if (self.writer_pos == self.reader_pos) {
+                    if (self.state == .closed) {
+                        self.mut.unlock();
+                        return null;
+                    }
                     self.reader_cw.wait(&self.mut);
                     if (self.writer_pos == self.reader_pos) {
                         self.mut.unlock();
@@ -31,6 +41,10 @@ pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
 
         pub fn put(self: *Self, data: T) void {
             self.mut.lock();
+            if (self.state == .closed) {
+                defer self.mut.unlock();
+                unreachable;
+            }
             while (true) {
                 if (self.writer_pos < self.reader_pos + buffer_size) {
                     self.buffer[self.writer_pos % buffer_size] = data;
@@ -41,6 +55,13 @@ pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
                 }
                 self.writer_cw.wait(&self.mut);
             }
+        }
+
+        pub fn close(self: *Self) void {
+            self.mut.lock();
+            self.state = .closed;
+            self.reader_cw.signal();
+            self.mut.unlock();
         }
     };
 }
@@ -61,7 +82,7 @@ test "non blocking" {
     try expectEqual(@intCast(u64, 2), rb.writer_pos);
     try expectEqual(@intCast(u64, 0), rb.reader_pos);
 
-    try expectEqual(@intCast(u8, 100), rb.get());
+    try expectEqual(@intCast(u8, 100), rb.get().?);
     try expectEqual(@intCast(u64, 2), rb.writer_pos);
     try expectEqual(@intCast(u64, 1), rb.reader_pos);
 
@@ -69,7 +90,7 @@ test "non blocking" {
     try expectEqual(@intCast(u64, 3), rb.writer_pos);
     try expectEqual(@intCast(u64, 1), rb.reader_pos);
 
-    try expectEqual(@intCast(u8, 101), rb.get());
+    try expectEqual(@intCast(u8, 101), rb.get().?);
     try expectEqual(@intCast(u64, 3), rb.writer_pos);
     try expectEqual(@intCast(u64, 2), rb.reader_pos);
 
@@ -79,12 +100,12 @@ test "non blocking" {
         try expectEqual(@intCast(u64, i + 2), rb.writer_pos);
         try expectEqual(@intCast(u64, i), rb.reader_pos);
 
-        try expectEqual(@intCast(u8, 100 + i), rb.get());
+        try expectEqual(@intCast(u8, 100 + i), rb.get().?);
         try expectEqual(@intCast(u64, i + 2), rb.writer_pos);
         try expectEqual(@intCast(u64, i + 1), rb.reader_pos);
     }
 
-    try expectEqual(@intCast(u8, 200), rb.get());
+    try expectEqual(@intCast(u8, 200), rb.get().?);
     try expectEqual(@intCast(u64, 101), rb.writer_pos);
     try expectEqual(@intCast(u64, 101), rb.reader_pos);
 }
@@ -102,6 +123,7 @@ const TestWriter = struct {
             }
             self.rb.put(i);
         }
+        self.rb.close();
     }
 };
 
@@ -110,8 +132,8 @@ const TestReader = struct {
     sleep: usize = 0,
     last_val: u8 = 0,
     fn loop(self: *@This()) void {
-        while (true) {
-            var val = self.rb.get();
+        while (self.rb.get()) |val| {
+            //var val = self.rb.get();
             if (self.sleep > 0) {
                 time.sleep(self.sleep * time.ns_per_ms);
             }
@@ -119,9 +141,9 @@ const TestReader = struct {
                 expectEqual(self.last_val+1, val) catch unreachable;
             }
             self.last_val = val;
-            if (val == 99) {
-                return;
-            }
+            // if (val == 99) {
+            //     return;
+            // }
         }
     }
 };
