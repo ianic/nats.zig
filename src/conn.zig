@@ -34,7 +34,7 @@ pub fn connect(alloc: Allocator) !*Conn {
 
 var connToCloseOnTerm: ?*Conn = null;
 
-pub fn sigCloseHandler(_: c_int) callconv(.C) void {
+fn sigCloseHandler(_: c_int) callconv(.C) void {
     if (connToCloseOnTerm) |nc| {
         nc.close() catch {};
     }
