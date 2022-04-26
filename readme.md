@@ -48,16 +48,17 @@ Or run test binary which both subscribes and publishes to the `test` subject:
 ``` zig
 const nats = @import("nats");
 
-// nats connection
+// establish nats connection
 var nc = try nats.connect(alloc);
 defer nc.deinit();
 
 // publish buf to the foo subject
 try nc.publish("subject", buf); 
 
-// subscribe, consume messages 
+// subscribe
 var sid = try nc.subscribe("foo");
 
+// consume messages 
 while (nc.read()) |msg| {
     // ...handle message
     msg.deinit(alloc);
