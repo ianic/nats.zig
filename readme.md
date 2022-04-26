@@ -43,6 +43,31 @@ Or run test binary which both subscribes and publishes to the `test` subject:
 ./zig-out/bin/test
 ```
 
+## Usage
+
+``` `zig
+const nats = @import("nats");
+
+// nats connection
+var nc = try nats.connect(alloc);
+defer nc.deinit();
+
+// publish buf to the foo subject
+try nc.publish("subject", buf); 
+
+// subscribe, consume messages 
+var sid = try nc.subscribe("foo");
+
+while (nc.read()) |msg| {
+    // ...handle message
+    msg.deinit(alloc);
+}
+
+// unsubscribe
+try nc.unsubscribe(sid);
+    
+```
+
 ## References
 
 * [nats protocol](https://docs.nats.io/reference/reference-protocols/nats-protocol) documentation (that page is referencing also Derek's [talk](https://www.youtube.com/watch?v=ylRKac5kSOk&t=646s) about zero allocation parser)  
