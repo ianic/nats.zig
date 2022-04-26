@@ -210,6 +210,7 @@ pub const Conn = struct {
         self.pubOp(pong_op) catch {};
     }
 
+    // send operation
     fn pubOp(self: *Self, buf: []const u8) !void {
         {
             self.write_mut.lock();
@@ -219,6 +220,7 @@ pub const Conn = struct {
         debugConnOut(buf);
     }
 
+    // send messasge
     fn pubMsg(self: *Self, op_buf: []const u8, data: []const u8) !void {
         {
             if (data.len > self.max_payload) {
@@ -242,7 +244,7 @@ pub const Conn = struct {
     }
 
     // subscribes handler to the subject
-    // returns subscription id for use in unSubscribe
+    // returns subscription id for use in unsubscribe
     pub fn subscribe(self: *Self, subject: []const u8) !u64 {
         self.mut.lock();
         self.ssid += 1;
@@ -274,52 +276,6 @@ pub const Conn = struct {
         _ = self.subs.remove(sid);
 
     }
-
-    // pub fn request(self: *Self, subject: []const u8, data: []const u8) !Msg {
-    //     var reply = "_INBOX.foo";
-    //     var sid = try self.subscribe(reply, &MsgHandler.init(self));
-    //     var req = Request{
-    //         .frame = @frame(),
-    //         .msg = undefined,
-    //     };
-    //     try self.requests.put(sid, &req);
-    //     var op_buf = self.op_builder.req(subject, reply, data.len);
-    //     try self.pubMsg(op_buf, data);
-    //     suspend {
-
-    //         // var loop = std.event.Loop.instance.?;
-    //         // try loop.runDetached(self.alloc, timeoutRequest, .{self, sid});
-    //     }
-    //     var opt_req = self.requests.get(sid);
-    //     if (opt_req) |r| {
-    //         try self.unSubscribe(sid);
-    //         _ = self.requests.remove(sid);
-    //         return r.msg;
-    //     }
-    //     return Error.RequestTimeout;
-    // }
-
-    // fn timeoutRequest(self: *Self, sid: u64) void {
-    //     time.sleep(1000 * time.ns_per_ms);
-    //     if (self.requests.get(sid)) |req| {
-    //         self.unSubscribe(sid) catch {};
-    //         _ = self.requests.remove(sid);
-    //         log.debug("timeout request {d}", .{sid});
-    //         resume req.frame;
-    //     } else {
-    //         log.debug("nothing to timeout request {d}", .{sid});
-    //     }
-    // }
-
-    // fn onMsg(self: *Self, msg: Msg) void {
-    //     var opt_req = self.requests.get(msg.sid);
-    //     if (opt_req) |req| {
-    //         req.msg = msg;
-    //         resume req.frame;
-    //     } else {
-    //         log.warn("no request found for sid: {d}", .{msg.sid});
-    //     }
-    // }
 
     pub fn close(self: *Self) !void {
         self.status = .closing;

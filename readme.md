@@ -32,7 +32,7 @@ Start subscriber in one terminal:
 ``` sh
 ./zig-out/bin/sub
 ```
-and publisher to send few messages to the subject on which subscriber is listening `foo`:
+and publisher to send few messages to the `foo` subject on which subscriber is listening:
 
 ``` sh
 ./zig-out/bin/pub
