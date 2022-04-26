@@ -45,7 +45,7 @@ Or run test binary which both subscribes and publishes to the `test` subject:
 
 ## Usage
 
-``` `zig
+``` zig
 const nats = @import("nats");
 
 // nats connection
