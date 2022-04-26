@@ -1,6 +1,6 @@
-# nats.zig - [Zig](https://www.ziglang.org/) client for the [NATS messaging system](https://nats.io)
+# nats.zig - [Zig](https://ziglang.org/) client for the [NATS](https://nats.io) messaging system
 
-## Why
+## About
 
 I needed concrete problem to learn some Zig. It was also opportunity to learn some details of the NATS protocol.
 
