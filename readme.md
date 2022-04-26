@@ -1,15 +1,15 @@
-# nats.zig - a [Zig](https://www.ziglang.org/) client for the [NATS messaging system](https://nats.io)
+# nats.zig - [Zig](https://www.ziglang.org/) client for the [NATS messaging system](https://nats.io)
 
 ## Why
 
 I needed concrete problem to learn some Zig. It was also opportunity to learn some details of the NATS protocol.
 
-NATS protocol [Parser](Parser.zig) is pretty much complete. Does not handle message headers but other operations sent by server: INFO, MSG, OK, ERR, PING, PONG are implemented, modeled on Go implementation, covered by tests. 
+NATS protocol [Parser](src/Parser.zig) is pretty much complete. Does not handle message headers but other operations sent by server: INFO, MSG, OK, ERR, PING, PONG are implemented, modeled on Go implementation, covered by tests. 
 
-The rest of the project, [Conn](conn.zig) is just bare minimum to get the connection to the NATS server and be able to publish/subscribe. It connects to the local NATS server, without any authentication, handles info/connect handshake, responds to the pongs and provides interface to publish and subscribe.   
+The rest of the project, [Conn](src/conn.zig) is just bare minimum to get the connection to the NATS server and be able to publish/subscribe. It connects to the local NATS server, without any authentication, handles info/connect handshake, responds to the pongs and provides interface to publish and subscribe.   
 
 I started with the evented version but the switched to the threaded. Zig is currently more complete there, event loop is still in the early sage.   
-Conn creates separate thread for reading from the TCP connection and parsing incoming bytes into operations. The rest is handled in the main thread. Those threads are connected by the [RingBuffer](RingBuffer.zig) in which parser writes operations and Conn reads from it. 
+Conn creates separate thread for reading from the TCP connection and parsing incoming bytes into operations. The rest is handled in the main thread. Those threads are connected by the [RingBuffer](src/RingBuffer.zig) in which parser writes operations and Conn reads from it. 
 
 ## Try
 
@@ -18,7 +18,7 @@ Build project:
 ``` sh
 zig-build
 ```
-I'm currently using master 0.10-dev [release]https://ziglang.org/download/, but the release 0.9.1 is also fine.  
+I'm currently using master 0.10-dev [release](https://ziglang.org/download/), but the release 0.9.1 is also fine.  
 
 Start local nats server:
 
