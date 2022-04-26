@@ -40,6 +40,7 @@ fn sigCloseHandler(_: c_int) callconv(.C) void {
     }
 }
 
+// catch sigint and close provided nc
 pub fn closeOnTerm(nc: *Conn) !void {
     connToCloseOnTerm = nc;
     try os.sigaction(os.SIG.INT, &os.Sigaction{

@@ -1,8 +1,29 @@
+//! NATS protocol parser.
+//! Inspired by Go zero allocation parser: https://github.com/nats-io/nats.go/blob/main/parser.go
+//!
+//! Usage:
+//!     var parser = Parser.init(allocator);
+//!     defer parser.deinit();
+//!     var buf: [conn_read_buffer_size]u8 = undefined;              // allocate reusable buffer
+//!     while (true) {
+//!         var bytes_read = try self.client.read(buf[0..], 0);      // read from tcp client into buf
+//!         if (bytes_read == 0) {
+//!             ...                                                  // handle EOF
+//!         }
+//!         try parser.push(buf[0..bytes_read]);                     // push buf to the parser
+//!         while (try parser.next()) |op| {                         // read operations found in buf
+//!             ...                                                  // handle operation
+//!         }
+//!     }
+//!
+//! Allocation is happening when making copy of the Msg attributes subject, reply and payload.
+//! And also for OpErr and Info attributes.
+//! Client should call deinit for each of those operations.
+
 const std = @import("std");
 const assert = std.debug.assert;
 const fmt = std.fmt;
 const mem = std.mem;
-const event = std.event;
 const Allocator = std.mem.Allocator;
 
 // testing imports
@@ -19,7 +40,7 @@ const cr_lf = "\r\n";
 
 const Self = @This();
 
-// protocol operations
+// protocol operation names
 // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#protocol-messages
 const OpName = enum {
     // sent by server
@@ -29,16 +50,17 @@ const OpName = enum {
     err,
     // sent by client
     connect,
-    pub_op, // pub is reserved word
+    pub_op, // adding _op suffix because pub is reserved word
     sub,
     unsub,
     // sent by both client and server
     ping,
     pong,
-    // unsupported
+    // currently unsupported
     hmsg,
 };
 
+// protocol operations
 pub const Op = union(OpName) {
     info: Info,
     msg: Msg,
@@ -65,20 +87,21 @@ pub const Op = union(OpName) {
     }
 };
 
+// nats message
 pub const Msg = struct {
     subject: []const u8,
-    sid: u64,
+    sid: u64, // subscription id
     reply: ?[]const u8,
     size: u64,
     payload: ?[]const u8 = null,
 
     pub fn deinit(self: Msg, alloc: Allocator) void {
         alloc.free(self.subject);
-        if (self.reply != null) {
-            alloc.free(self.reply.?);
+        if (self.reply) |r| {
+            alloc.free(r);
         }
-        if (self.payload != null) {
-            alloc.free(self.payload.?);
+        if (self.payload) |p| {
+            alloc.free(p);
         }
     }
 
@@ -161,6 +184,7 @@ pub const Error = error{
     OpNotFound,
 };
 
+// parser states
 const State = enum {
     start,
     i,
@@ -193,9 +217,6 @@ const State = enum {
     ok,
 };
 
-// reads operations from the underlying reader in chunks
-// calls handler for each parsed operation
-
 var scratch: [max_args_len]u8 = undefined;
 
 alloc: Allocator,
@@ -221,6 +242,8 @@ pub fn init(alloc: Allocator) Self {
     return .{ .alloc = alloc };
 }
 
+// Parses one operation from the buf.
+// Buf should contain one complete operation.
 pub fn readOp(self: *Self, buf: []const u8) !Op {
     try self.push(buf);
     const oop = try self.next();
@@ -235,7 +258,6 @@ pub fn readOp(self: *Self, buf: []const u8) !Op {
 // until next returns null.
 pub fn push(self: *Self, buf: []const u8) !void {
     if (self.consumed) {
-        //print("setting buf '{s}'\n", .{buf});
         self.read_buffer = buf;
         self.args_start = 0;
         self.drop = 0;
@@ -243,10 +265,11 @@ pub fn push(self: *Self, buf: []const u8) !void {
         self.consumed = false;
         return;
     }
-    //print("pos: {d} buf.len: {d} buf '{s}' new buf '{s}'\n", .{self.pos, self.read_buffer.len, self.read_buffer, buf});
     return Error.BufferNotConsumed;
 }
 
+// true if we reached the end of the read_buffer
+// ...with few special cases: \r\n left in buffer and the like
 fn readBufferConsumed(self: *Self) bool {
     return ((self.read_buffer.len == 0) or
         (self.pos == self.read_buffer.len) or
@@ -254,15 +277,14 @@ fn readBufferConsumed(self: *Self) bool {
         (self.read_buffer.len > 1 and self.pos == self.read_buffer.len - 2 and self.read_buffer[self.read_buffer.len - 2] == '\r' and self.read_buffer[self.read_buffer.len - 1] == '\n'));
 }
 
-pub fn hasMore(self: *Self) bool {
-    return !self.readBufferConsumed();
-}
-
-// objasni kako ovo radi
-// vraca error ako se parser raspadne
-// inace vraca op koji nadje
-// ili ako dodje do kraja buffera onda vrati null
-// od klijenta se ocekuje da nakon sto postavi buf zove next dok ne vrati null
+// Parses read_buffer provided in the push.
+// On each call returns operation found in read_buffer or null when reaches end of buffer..
+// Handles split buffer scenario by preserving args or payload read so far.
+// Will return error on unparsable protocol.
+// Should be used in loop:
+//   while (try parser.next()) |op| {
+//     ... handle operation
+//   }
 pub fn next(self: *Self) !?Op {
     const buf = self.read_buffer;
 
