@@ -16,11 +16,13 @@ Conn creates separate thread for reading from the TCP connection and parsing inc
 Build project:
 
 ``` sh
-zig-build
+git clone git@github.com:ianic/nats.zig.git
+cd nats.zig
+zig build
 ```
 I'm currently using master 0.10-dev [release](https://ziglang.org/download/), but the release 0.9.1 is also fine.  
 
-Start local nats server:
+You should have [installed](https://docs.nats.io/legacy/stan/changes/install) nats-server. Start it locally:
 
 ``` sh
 nats-server
