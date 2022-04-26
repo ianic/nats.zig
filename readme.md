@@ -38,6 +38,11 @@ and publisher to send few messages to the `foo` subject on which subscriber is l
 ./zig-out/bin/pub
 ```
 
+Or run test binary which both subscribes and publishes to the `test` subject:
+``` sh
+./zig-out/bin/test
+```
+
 ## References
 
 * [nats protocol](https://docs.nats.io/reference/reference-protocols/nats-protocol) documentation (that page is referencing also Derek's [talk](https://www.youtube.com/watch?v=ylRKac5kSOk&t=646s) about zero allocation parser)  
