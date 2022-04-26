@@ -1,11 +1,13 @@
 const std = @import("std");
 const Thread = std.Thread;
 
-const State = enum {
-    open,
-    closed,
-};
-
+// Intended for use in multi threaded envrionment where one thread is writing to
+// the RingBuffer and another is reading. Both put and get operations are
+// blocking. Put in the case when RB is full, get in case when there is no new
+// messages.
+//
+// Uses conditon variables. Note to myself: cw.wait unlocks waits for signal and
+// then locks provided mutex.
 pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
     return struct {
         buffer: [buffer_size]T = undefined,
@@ -16,17 +18,24 @@ pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
         writer_pos: u64 = 0,
         state: State = .open,
         const Self = @This();
+        const State = enum {
+            open,
+            closed,
+        };
 
+        // Use it in loop:
+        // while (rb.get()) |val| {...}
+        // Will block when RB is emtpy, and return null (exit while) when RB is closed.
         pub fn get(self: *Self) ?T {
             while (true) {
                 self.mut.lock();
-                if (self.writer_pos == self.reader_pos) {
-                    if (self.state == .closed) {
+                if (self.empty()) {
+                    if (self.state == .closed) { // returns null when closed
                         self.mut.unlock();
                         return null;
                     }
-                    self.reader_cw.wait(&self.mut);
-                    if (self.writer_pos == self.reader_pos) {
+                    self.reader_cw.wait(&self.mut); // block until writer puts something
+                    if (self.empty()) {
                         self.mut.unlock();
                         continue;
                     }
@@ -39,24 +48,35 @@ pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
             }
         }
 
+        fn empty(self: *Self) bool {
+            return self.writer_pos == self.reader_pos;
+        }
+
+        fn full(self: *Self) bool {
+            return self.writer_pos == self.reader_pos + buffer_size;
+        }
+
+        // Will block when RB is full, and panic if put is make after close.
         pub fn put(self: *Self, data: T) void {
             self.mut.lock();
-            if (self.state == .closed) {
-                defer self.mut.unlock();
+            if (self.state == .closed) { // panics when closed
+                self.mut.unlock();
                 unreachable;
             }
             while (true) {
-                if (self.writer_pos < self.reader_pos + buffer_size) {
-                    self.buffer[self.writer_pos % buffer_size] = data;
-                    self.writer_pos += 1;
-                    self.reader_cw.signal();
-                    self.mut.unlock();
-                    return;
+                if (self.full()) {
+                    self.writer_cw.wait(&self.mut); // block until reader advances
+                    continue;
                 }
-                self.writer_cw.wait(&self.mut);
+                self.buffer[self.writer_pos % buffer_size] = data;
+                self.writer_pos += 1;
+                self.reader_cw.signal();
+                self.mut.unlock();
+                return;
             }
         }
 
+        // Signal close. You should not write to the RB after close.
         pub fn close(self: *Self) void {
             self.mut.lock();
             self.state = .closed;
@@ -65,7 +85,6 @@ pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
         }
     };
 }
-
 
 /// tests
 const expectEqual = std.testing.expectEqual;
@@ -133,7 +152,6 @@ const TestReader = struct {
     last_val: u8 = 0,
     fn loop(self: *@This()) void {
         while (self.rb.get()) |val| {
-            //var val = self.rb.get();
             if (self.sleep > 0) {
                 time.sleep(self.sleep * time.ns_per_ms);
             }
@@ -141,9 +159,6 @@ const TestReader = struct {
                 expectEqual(self.last_val + 1, val) catch unreachable;
             }
             self.last_val = val;
-            // if (val == 99) {
-            //     return;
-            // }
         }
     }
 };
