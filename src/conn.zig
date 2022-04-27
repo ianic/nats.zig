@@ -274,7 +274,6 @@ pub const Conn = struct {
         self.mut.lock();
         defer self.mut.unlock();
         _ = self.subs.remove(sid);
-
     }
 
     pub fn close(self: *Self) !void {

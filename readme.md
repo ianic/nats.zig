@@ -53,7 +53,7 @@ var nc = try nats.connect(alloc);
 defer nc.deinit();
 
 // publish buf to the foo subject
-try nc.publish("subject", buf); 
+try nc.publish("foo", buf); 
 
 // subscribe
 var sid = try nc.subscribe("foo");
