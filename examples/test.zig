@@ -12,7 +12,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var nc = try nats.connect(alloc);
+    var nc = try nats.connect(.{.alloc = alloc});
     defer nc.deinit();
     var sid = try nc.subscribe(subject);
 

@@ -12,15 +12,18 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     // nats connection
-    var nc = try nats.connect(alloc);
+    var nc = try nats.connect(.{.alloc = alloc});
     defer nc.deinit();
 
     // publish 10 messages (reusing the scratch buffer, and sleeping a little bit after each)
     var scratch: [128]u8 = undefined;
     var i: u64 = 0;
-    while (i < 10) : (i += 1) {
+    while (i < 1024) : (i += 1) {
         var buf = std.fmt.bufPrint(scratch[0..], "msg no {d}", .{i}) catch unreachable;
-        try nc.publish("foo", buf); // publish nats message to the foo subject
-        time.sleep(100 * time.ns_per_ms);
+        // publish nats message to the foo subject
+        nc.publish("foo", buf) catch |err| {
+            std.log.err("publish err: {}", .{err});
+        };
+        time.sleep(1000 * time.ns_per_ms);
     }
 }

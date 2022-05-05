@@ -12,7 +12,7 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     // nats connection
-    var nc = try nats.connect(alloc);
+    var nc = try nats.connect(.{.alloc = alloc});
     defer nc.deinit();
     try nats.closeOnTerm(nc);
 

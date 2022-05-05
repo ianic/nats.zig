@@ -25,11 +25,32 @@ const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required
 const pong_op = "PONG\r\n";
 const ping_op = "PING\r\n";
 const inbox_prefix = "_INBOX.";
+const max_reconnect: u8 = 60;
+const reconnect_wait = time.ns_per_s * 2;
 
 const log = std.log.scoped(.nats);
 
-pub fn connect(alloc: Allocator) !*Conn {
-    return try Conn.connect(alloc);
+pub const ConnectOptions = struct {
+    alloc: Allocator,
+    host: []const u8 = "localhost",
+    port: u16 = 4222,
+};
+
+pub fn connect(opt: ConnectOptions) !*Conn {
+    try ignoreSigPipe();
+    return try Conn.connect(opt);
+}
+
+fn ignoreSigPipe() !void {
+    // write to the closed socket raises signal (which closes app by default)
+    // instead of returning error
+    // by ignoring we got error on socket write
+    var act = os.Sigaction{
+        .handler = .{ .sigaction = os.SIG.IGN },
+        .mask = os.empty_sigset,
+        .flags = 0,
+    };
+    try os.sigaction(os.SIG.PIPE, &act, null);
 }
 
 var connToCloseOnTerm: ?*Conn = null;
@@ -58,6 +79,7 @@ const Error = error{
     RequestTimeout,
     MaxPayloadExceeded,
     ConnectionResetByPeer,
+    ClientNotConnected,
 };
 
 pub const Conn = struct {
@@ -70,8 +92,9 @@ pub const Conn = struct {
     const ReadBuffer = RingBuffer(Op, op_read_buffer_size);
     const Self = @This();
 
+    opt: ConnectOptions,
     alloc: Allocator,
-    client: net.tcp.Client,
+    client: ?net.tcp.Client,
     scratch: [max_args_len]u8 = undefined,
     ssid: u64 = 0,
     subs: std.AutoHashMap(u64, Subscription),
@@ -86,32 +109,98 @@ pub const Conn = struct {
     reader_trd: Thread = undefined,
     max_payload: u64 = 0,
 
-    fn connect(alloc: Allocator) !*Conn {
-        const addr = net.ip.Address.initIPv4(try std.x.os.IPv4.parse("127.0.0.1"), 4222);
-        const client = try net.tcp.Client.init(.ip, .{ .close_on_exec = true });
-        try client.connect(addr);
-        errdefer client.deinit();
+    fn connect(opt: ConnectOptions) !*Conn {
+        var alloc = opt.alloc;
 
         var conn = try alloc.create(Self);
         conn.* = Conn{
-            .client = client,
+            .opt = opt,
             .alloc = alloc,
+            .client = null,
             .subs = std.AutoHashMap(u64, Subscription).init(alloc),
         };
         errdefer conn.deinit();
 
+        try conn.tcpConnect();
         try conn.connectHandshake();
         conn.reader_trd = try Thread.spawn(.{}, Self.reader, .{conn});
         return conn;
     }
 
-    fn connectHandshake(self: *Self) !void {
+    fn tcpConnect(self: *Self) !void {
+        const addr = net.ip.Address.initIPv4(try std.x.os.IPv4.parse("127.0.0.1"), 4222);
+        const client = try net.tcp.Client.init(.ip, .{ .close_on_exec = true });
+        try client.connect(addr);
+        errdefer client.deinit();
+        self.client = client;
+    }
+
+    fn reconnectLoop(self: *Self) !void {
+        @atomicStore(Status, &self.status, .disconnected, .SeqCst);
+        self.clientClose();
+
+        var no: u8 = 0;
+        while (true) {
+            self.reconnect() catch |err| {
+                self.clientClose();
+                log.err("reconnect {d}, error: {}", .{ no, err });
+                no += 1;
+                if (no == max_reconnect) {
+                    return err;
+                }
+                time.sleep(reconnect_wait);
+                continue;
+            };
+            return;
+        }
+    }
+
+    fn reconnect(self: *Self) anyerror!void {
+        try self.tcpConnect();
+        try self.connectHandshake();
+        try self.resubscribe();
+    }
+
+    fn resubscribe(self: *Self) !void {
+        var iter = self.subs.valueIterator();
+        while (iter.next()) |s| {
+            try self.write(self.op_builder.sub(s.subject, s.sid), null);
+        }
+    }
+
+    fn clientRead(self: *Self, buf: []u8) !usize {
+        if (self.client) |c| {
+            return try c.read(buf, 0);
+        }
+        return Error.ClientNotConnected;
+    }
+
+    fn clientWrite(self: *Self, buf: []const u8) !void {
+        if (self.client) |c| {
+            _ = c.write(buf, 0) catch |err| {
+                log.err("publish: {}", .{err});
+                self.clientClose();
+            };
+            return;
+        }
+        return Error.ClientNotConnected;
+    }
+
+    fn clientClose(self: *Self) void {
+        if (self.client) |c| {
+            c.shutdown(.both) catch {};
+            c.deinit();
+        }
+        self.client = null;
+    }
+
+    fn connectHandshake(self: *Self) anyerror!void {
         var parser = Parser.init(self.alloc);
         defer parser.deinit();
         var buf: [max_args_len]u8 = undefined;
 
         // expect INFO at start
-        var offset = try self.client.read(buf[0..], 0);
+        var offset = try self.clientRead(buf[0..]);
         debugConnIn(buf[0..offset]);
         var op = try parser.readOp(buf[0..offset]);
         if (op != .info) {
@@ -120,33 +209,35 @@ pub const Conn = struct {
         self.onInfo(op.info);
 
         // send CONNECT, PING
-        _ = try self.pubOp(connect_op);
-        _ = try self.pubOp(ping_op);
+        _ = try self.clientWrite(connect_op);
+        debugConnOut(connect_op);
+        _ = try self.clientWrite(ping_op);
+        debugConnOut(ping_op);
 
         // expect PONG
-        offset = try self.client.read(buf[0..], 0);
+        offset = try self.clientRead(buf[0..]);
         debugConnIn(buf[0..offset]);
         op = try parser.readOp(buf[0..offset]);
         if (op != .pong) {
             return Error.HandshakeFailed;
         }
-        self.status = .connected;
+        @atomicStore(Status, &self.status, .connected, .SeqCst);
     }
 
     fn reader(self: *Self) void {
-        self.readLoop() catch |err| {
-            if (!(self.isClosed() and (err == Error.ConnectionResetByPeer or err == Error.EOF))) {
-                self.err = err;
-                log.err("reader error: {}", .{err});
-            }
-        };
+        while (true) {
+            self.readLoop() catch |err| {
+                if (self.isClosing()) {
+                    break;
+                }
+                log.err("read loop error: {}", .{err});
+            };
+            self.reconnectLoop() catch |err| {
+                log.err("reconnect failed {}", .{err});
+                break;
+            };
+        }
         self.read_buffer.close();
-    }
-
-    fn isClosed(self: *Self) bool {
-        self.mut.lock();
-        defer self.mut.unlock();
-        return self.status == .closing;
     }
 
     fn readLoop(self: *Self) !void {
@@ -155,9 +246,9 @@ pub const Conn = struct {
 
         var buf: [conn_read_buffer_size]u8 = undefined;
         while (true) {
-            var bytes_read = try self.client.read(buf[0..], 0);
+            var bytes_read = try self.clientRead(buf[0..]);
             if (bytes_read == 0) {
-                if (self.status == .closing) {
+                if (self.isClosing()) {
                     return;
                 }
                 return Error.EOF;
@@ -168,6 +259,10 @@ pub const Conn = struct {
                 self.read_buffer.put(op);
             }
         }
+    }
+
+    pub fn isClosing(self: *Self) bool {
+        return @atomicLoad(Status, &self.status, .SeqCst) == .closing;
     }
 
     pub fn read(self: *Self) ?Msg {
@@ -207,40 +302,36 @@ pub const Conn = struct {
     }
 
     fn onPing(self: *Self) void {
-        self.pubOp(pong_op) catch {};
+        self.write(pong_op, null) catch {};
     }
 
-    // send operation
-    fn pubOp(self: *Self, buf: []const u8) !void {
-        {
-            self.write_mut.lock();
-            defer self.write_mut.unlock();
-            _ = try self.client.write(buf, 0);
-        }
-        debugConnOut(buf);
-    }
-
-    // send messasge
-    fn pubMsg(self: *Self, op_buf: []const u8, data: []const u8) !void {
-        {
-            if (data.len > self.max_payload) {
+    fn write(self: *Self, op_buf: []const u8, data: ?[]const u8) !void {
+        if (data) |d| {
+            if (d.len > self.max_payload) {
                 return Error.MaxPayloadExceeded;
             }
+        }
+        {
             self.write_mut.lock();
             defer self.write_mut.unlock();
-            _ = try self.client.write(op_buf, 0);
-            _ = try self.client.write(data, 0);
-            _ = try self.client.write(cr_lf, 0);
+
+            _ = try self.clientWrite(op_buf);
+            if (data) |d| {
+                _ = try self.clientWrite(d);
+                _ = try self.clientWrite(cr_lf);
+            }
         }
         debugConnOut(op_buf);
-        debugConnOut(data);
+        if (data) |d| {
+            debugConnOut(d);
+        }
     }
 
     // publish message data on the subject
     // data is not copied
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
         var op_buf = self.op_builder.pubOp(subject, data.len);
-        try self.pubMsg(op_buf, data);
+        try self.write(op_buf, data);
     }
 
     // subscribes handler to the subject
@@ -249,7 +340,11 @@ pub const Conn = struct {
         self.mut.lock();
         self.ssid += 1;
         var sid = self.ssid;
+
+        const subject_copy = try self.alloc.alloc(u8, subject.len);
+        mem.copy(u8, subject_copy, subject);
         var sub = Subscription{
+            .subject = subject_copy,
             .sid = sid,
         };
         {
@@ -261,24 +356,24 @@ pub const Conn = struct {
             defer self.mut.unlock();
             _ = self.subs.remove(sid);
         }
-        try self.pubOp(self.op_builder.sub(subject, sid));
+        try self.write(self.op_builder.sub(subject, sid), null);
         return sid;
     }
 
     // use subscription id from subscribe to stop receiving messages
     pub fn unsubscribe(self: *Self, sid: u64) !void {
-        if (self.isClosed()) {
-            return;
-        }
-        try self.pubOp(self.op_builder.unsub(sid));
+        try self.write(self.op_builder.unsub(sid), null);
         self.mut.lock();
         defer self.mut.unlock();
-        _ = self.subs.remove(sid);
+        if (self.subs.getPtr(sid)) |s| {
+            _ = self.subs.remove(sid);
+            s.deinit(self.alloc);
+        }
     }
 
     pub fn close(self: *Self) !void {
-        self.status = .closing;
-        try self.client.shutdown(.both);
+        @atomicStore(Status, &self.status, .closing, .SeqCst);
+        self.clientClose();
         Thread.join(self.reader_trd);
     }
 
@@ -286,8 +381,13 @@ pub const Conn = struct {
         if (self.status == .connected) {
             self.close() catch {};
         }
+        self.read_buffer.close();
         while (self.read_buffer.get()) |op| {
             op.deinit(self.alloc);
+        }
+        var iter = self.subs.valueIterator();
+        while (iter.next()) |s| {
+            s.deinit(self.alloc);
         }
         self.subs.deinit();
         if (self.info) |in| {
@@ -296,12 +396,21 @@ pub const Conn = struct {
         if (self.err_op) |eo| {
             eo.deinit(self.alloc);
         }
+        if (self.client) |c| {
+            c.deinit();
+        }
         self.alloc.destroy(self);
     }
 };
 
 const Subscription = struct {
     sid: u64,
+    subject: []u8,
+
+    const Self = @This();
+    fn deinit(self: *Self, alloc: Allocator) void {
+        alloc.free(self.subject);
+    }
 };
 
 const OpBuilder = struct {
