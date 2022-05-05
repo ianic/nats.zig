@@ -94,16 +94,13 @@ pub const Conn = struct {
 
     opt: ConnectOptions,
     alloc: Allocator,
-    client: ?net.tcp.Client,
-    scratch: [max_args_len]u8 = undefined,
-    ssid: u64 = 0,
-    subs: std.AutoHashMap(u64, Subscription),
+    net_cli: ?net.tcp.Client,
+    subs: *Subscriptions,
     op_builder: OpBuilder = OpBuilder{},
     err: ?anyerror = null,
     err_op: ?OpErr = null,
     info: ?Info = null,
     status: Status = .disconnected,
-    mut: Thread.Mutex = Thread.Mutex{},
     write_mut: Thread.Mutex = Thread.Mutex{},
     read_buffer: ReadBuffer = ReadBuffer{},
     reader_trd: Thread = undefined,
@@ -116,8 +113,8 @@ pub const Conn = struct {
         conn.* = Conn{
             .opt = opt,
             .alloc = alloc,
-            .client = null,
-            .subs = std.AutoHashMap(u64, Subscription).init(alloc),
+            .net_cli = null,
+            .subs = try Subscriptions.init(alloc),
         };
         errdefer conn.deinit();
 
@@ -132,17 +129,17 @@ pub const Conn = struct {
         const client = try net.tcp.Client.init(.ip, .{ .close_on_exec = true });
         try client.connect(addr);
         errdefer client.deinit();
-        self.client = client;
+        self.net_cli = client;
     }
 
     fn reconnectLoop(self: *Self) !void {
         @atomicStore(Status, &self.status, .disconnected, .SeqCst);
-        self.clientClose();
+        self.netClose();
 
         var no: u8 = 0;
         while (true) {
             self.reconnect() catch |err| {
-                self.clientClose();
+                self.netClose();
                 log.err("reconnect {d}, error: {}", .{ no, err });
                 no += 1;
                 if (no == max_reconnect) {
@@ -162,36 +159,36 @@ pub const Conn = struct {
     }
 
     fn resubscribe(self: *Self) !void {
-        var iter = self.subs.valueIterator();
+        var iter = self.subs.iterator();
         while (iter.next()) |s| {
             try self.write(self.op_builder.sub(s.subject, s.sid), null);
         }
     }
 
-    fn clientRead(self: *Self, buf: []u8) !usize {
-        if (self.client) |c| {
+    fn netRead(self: *Self, buf: []u8) !usize {
+        if (self.net_cli) |c| {
             return try c.read(buf, 0);
         }
         return Error.ClientNotConnected;
     }
 
-    fn clientWrite(self: *Self, buf: []const u8) !void {
-        if (self.client) |c| {
+    fn netWrite(self: *Self, buf: []const u8) !void {
+        if (self.net_cli) |c| {
             _ = c.write(buf, 0) catch |err| {
                 log.err("publish: {}", .{err});
-                self.clientClose();
+                self.netClose();
             };
             return;
         }
         return Error.ClientNotConnected;
     }
 
-    fn clientClose(self: *Self) void {
-        if (self.client) |c| {
+    fn netClose(self: *Self) void {
+        if (self.net_cli) |c| {
             c.shutdown(.both) catch {};
             c.deinit();
         }
-        self.client = null;
+        self.net_cli = null;
     }
 
     fn connectHandshake(self: *Self) anyerror!void {
@@ -200,7 +197,7 @@ pub const Conn = struct {
         var buf: [max_args_len]u8 = undefined;
 
         // expect INFO at start
-        var offset = try self.clientRead(buf[0..]);
+        var offset = try self.netRead(buf[0..]);
         debugConnIn(buf[0..offset]);
         var op = try parser.readOp(buf[0..offset]);
         if (op != .info) {
@@ -209,13 +206,13 @@ pub const Conn = struct {
         self.onInfo(op.info);
 
         // send CONNECT, PING
-        _ = try self.clientWrite(connect_op);
+        _ = try self.netWrite(connect_op);
         debugConnOut(connect_op);
-        _ = try self.clientWrite(ping_op);
+        _ = try self.netWrite(ping_op);
         debugConnOut(ping_op);
 
         // expect PONG
-        offset = try self.clientRead(buf[0..]);
+        offset = try self.netRead(buf[0..]);
         debugConnIn(buf[0..offset]);
         op = try parser.readOp(buf[0..offset]);
         if (op != .pong) {
@@ -246,7 +243,7 @@ pub const Conn = struct {
 
         var buf: [conn_read_buffer_size]u8 = undefined;
         while (true) {
-            var bytes_read = try self.clientRead(buf[0..]);
+            var bytes_read = try self.netRead(buf[0..]);
             if (bytes_read == 0) {
                 if (self.isClosing()) {
                     return;
@@ -281,8 +278,6 @@ pub const Conn = struct {
     }
 
     fn onInfo(self: *Self, info: Info) void {
-        self.mut.lock();
-        defer self.mut.unlock();
         if (self.info) |in| {
             in.deinit(self.alloc);
         }
@@ -291,8 +286,6 @@ pub const Conn = struct {
     }
 
     fn onErr(self: *Self, err: OpErr) void {
-        self.mut.lock();
-        defer self.mut.unlock();
         self.err = Error.ServerError;
         if (self.err_op) |eo| {
             eo.deinit(self.alloc);
@@ -315,10 +308,10 @@ pub const Conn = struct {
             self.write_mut.lock();
             defer self.write_mut.unlock();
 
-            _ = try self.clientWrite(op_buf);
+            _ = try self.netWrite(op_buf);
             if (data) |d| {
-                _ = try self.clientWrite(d);
-                _ = try self.clientWrite(cr_lf);
+                _ = try self.netWrite(d);
+                _ = try self.netWrite(cr_lf);
             }
         }
         debugConnOut(op_buf);
@@ -337,24 +330,9 @@ pub const Conn = struct {
     // subscribes handler to the subject
     // returns subscription id for use in unsubscribe
     pub fn subscribe(self: *Self, subject: []const u8) !u64 {
-        self.mut.lock();
-        self.ssid += 1;
-        var sid = self.ssid;
-
-        const subject_copy = try self.alloc.alloc(u8, subject.len);
-        mem.copy(u8, subject_copy, subject);
-        var sub = Subscription{
-            .subject = subject_copy,
-            .sid = sid,
-        };
-        {
-            defer self.mut.unlock();
-            try self.subs.put(sid, sub);
-        }
+        var sid = try self.subs.put(subject);
         errdefer {
-            self.mut.lock();
-            defer self.mut.unlock();
-            _ = self.subs.remove(sid);
+            self.subs.remove(sid);
         }
         try self.write(self.op_builder.sub(subject, sid), null);
         return sid;
@@ -363,17 +341,12 @@ pub const Conn = struct {
     // use subscription id from subscribe to stop receiving messages
     pub fn unsubscribe(self: *Self, sid: u64) !void {
         try self.write(self.op_builder.unsub(sid), null);
-        self.mut.lock();
-        defer self.mut.unlock();
-        if (self.subs.getPtr(sid)) |s| {
-            _ = self.subs.remove(sid);
-            s.deinit(self.alloc);
-        }
+        self.subs.remove(sid);
     }
 
     pub fn close(self: *Self) !void {
         @atomicStore(Status, &self.status, .closing, .SeqCst);
-        self.clientClose();
+        self.netClose();
         Thread.join(self.reader_trd);
     }
 
@@ -385,20 +358,16 @@ pub const Conn = struct {
         while (self.read_buffer.get()) |op| {
             op.deinit(self.alloc);
         }
-        var iter = self.subs.valueIterator();
-        while (iter.next()) |s| {
-            s.deinit(self.alloc);
-        }
-        self.subs.deinit();
         if (self.info) |in| {
             in.deinit(self.alloc);
         }
         if (self.err_op) |eo| {
             eo.deinit(self.alloc);
         }
-        if (self.client) |c| {
+        if (self.net_cli) |c| {
             c.deinit();
         }
+        self.subs.deinit();
         self.alloc.destroy(self);
     }
 };
@@ -412,6 +381,97 @@ const Subscription = struct {
         alloc.free(self.subject);
     }
 };
+
+
+const SubsMap = std.AutoHashMap(u64, Subscription);
+
+const Subscriptions = struct {
+    sid: u64 = 0,
+    alloc: Allocator,
+    subs: std.AutoHashMap(u64, Subscription),
+    mut: Thread.Mutex = Thread.Mutex{},
+    const Self = @This();
+
+    fn init(alloc: Allocator) !*Self {
+        var ss = try alloc.create(Self);
+        ss.* = .{
+            .alloc = alloc,
+            .subs = SubsMap.init(alloc),
+        };
+        return ss;
+    }
+
+    fn deinit(self: *Self) void {
+        var iter = self.iterator();
+        while (iter.next()) |s| {
+            s.deinit(self.alloc);
+        }
+        self.subs.deinit();
+        self.alloc.destroy(self);
+    }
+
+    fn put(self: *Self, subject: []const u8) !u64 {
+        self.mut.lock();
+        defer self.mut.unlock();
+
+        self.sid += 1;
+        var sid = self.sid;
+
+        const subject_copy = try self.alloc.alloc(u8, subject.len);
+        mem.copy(u8, subject_copy, subject);
+        var sub = Subscription{
+            .subject = subject_copy,
+            .sid = sid,
+        };
+        try self.subs.put(sid, sub);
+        return sid;
+    }
+
+    fn remove(self: *Self, sid: u64) void {
+        self.mut.lock();
+        defer self.mut.unlock();
+
+        if (self.subs.getPtr(sid)) |s| {
+            s.deinit(self.alloc);
+            _ = self.subs.remove(sid);
+        }
+    }
+
+    fn iterator(self: *Self) SubsMap.ValueIterator {
+        self.mut.lock();
+        defer self.mut.unlock();
+
+        return self.subs.valueIterator();
+    }
+};
+
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const expectEqualStrings = std.testing.expectEqualStrings;
+
+test "subscriptions put/remove" {
+    var ss = try Subscriptions.init(std.testing.allocator);
+    defer ss.deinit();
+
+    var id1 = try ss.put("foo");
+    var id2 = try ss.put("bar");
+    var id3 = try ss.put("jozo");
+
+    try expectEqual(@intCast(u64, 1), id1);
+    try expectEqual(@intCast(u64, 2), id2);
+    try expectEqual(@intCast(u64, 3), id3);
+    try expectEqual(@intCast(u32, 3), ss.subs.count());
+
+    ss.remove(id3);
+    try expectEqual(@intCast(u32, 2), ss.subs.count());
+
+    var i = ss.iterator();
+    while (i.next()) |s| {
+        if (!(std.mem.eql(u8, "foo", s.subject) or std.mem.eql(u8, "bar", s.subject))) {
+            unreachable;
+        }
+    }
+}
 
 const OpBuilder = struct {
     scratch: [max_args_len]u8 = undefined,
@@ -475,8 +535,6 @@ const OpBuilder = struct {
         return buf[0..offset];
     }
 };
-
-const expectEqualStrings = std.testing.expectEqualStrings;
 
 test "operation builder" {
     var ob = OpBuilder{};
