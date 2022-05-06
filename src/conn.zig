@@ -87,7 +87,6 @@ pub const Conn = struct {
         disconnected,
         connected,
         closing,
-        //closed,
     };
     const ReadBuffer = RingBuffer(Op, op_read_buffer_size);
     const Self = @This();
@@ -186,9 +185,7 @@ pub const Conn = struct {
     fn netClose(self: *Self) void {
         if (self.net_cli) |c| {
             c.shutdown(.both) catch {};
-            c.deinit();
         }
-        self.net_cli = null;
     }
 
     fn connectHandshake(self: *Self) anyerror!void {
@@ -224,11 +221,14 @@ pub const Conn = struct {
     fn reader(self: *Self) void {
         while (true) {
             self.readLoop() catch |err| {
-                if (self.isClosing()) {
-                    break;
+                if (!self.isClosing()) {
+                    log.err("read loop error: {}", .{err});
                 }
-                log.err("read loop error: {}", .{err});
             };
+
+            if (self.isClosing()) {
+                break;
+            }
             self.reconnectLoop() catch |err| {
                 log.err("reconnect failed {}", .{err});
                 break;
@@ -245,9 +245,6 @@ pub const Conn = struct {
         while (true) {
             var bytes_read = try self.netRead(buf[0..]);
             if (bytes_read == 0) {
-                if (self.isClosing()) {
-                    return;
-                }
                 return Error.EOF;
             }
             debugConnIn(buf[0..bytes_read]);
@@ -354,6 +351,9 @@ pub const Conn = struct {
         if (self.status == .connected) {
             self.close() catch {};
         }
+        if (self.net_cli) |c| {
+            c.deinit();
+        }
         self.read_buffer.close();
         while (self.read_buffer.get()) |op| {
             op.deinit(self.alloc);
@@ -363,9 +363,6 @@ pub const Conn = struct {
         }
         if (self.err_op) |eo| {
             eo.deinit(self.alloc);
-        }
-        if (self.net_cli) |c| {
-            c.deinit();
         }
         self.subs.deinit();
         self.alloc.destroy(self);
@@ -381,7 +378,6 @@ const Subscription = struct {
         alloc.free(self.subject);
     }
 };
-
 
 const SubsMap = std.AutoHashMap(u64, Subscription);
 

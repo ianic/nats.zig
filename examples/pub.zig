@@ -18,7 +18,7 @@ pub fn main() !void {
     // publish 10 messages (reusing the scratch buffer, and sleeping a little bit after each)
     var scratch: [128]u8 = undefined;
     var i: u64 = 0;
-    while (i < 1024) : (i += 1) {
+    while (i < 2) : (i += 1) {
         var buf = std.fmt.bufPrint(scratch[0..], "msg no {d}", .{i}) catch unreachable;
         // publish nats message to the foo subject
         nc.publish("foo", buf) catch |err| {
