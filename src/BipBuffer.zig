@@ -10,92 +10,111 @@ pub fn BipBuffer(buflen: usize) type {
         buffer: [buflen]u8 = undefined,
         buflen: usize = buflen,
 
-        // a buffer
-        a_pos: usize = 0,
-        a_len: usize = 0,
+        w: usize = 0, // writer position
+        r: usize = 0, // reader position
+        h: usize = buflen, // high water mark
 
-        // b buffer - alway start at the head
-        b_len: usize = 0,
+        const Self = @This();
 
-        // reserved buffer part
-        r_pos: usize = 0,
-        r_len: usize = 0,
-
-        pub fn writeReserve(self: *Self, len: usize) Error![]const u8 {
-            if (self.r_len > 0) {
-                return Error.NestedReserve; // another reserve before commit of the previous
-            }
-            if (len > self.buflen) {
-                return Error.Overflow;
-            }
-            if (self.b_len > 0) {
-                // reserve on top of b
-                if (len + self.b_len >= self.a.pos) {
-                    return Error.Overflow; // no space to allocate
+        // returns writable part of the buffer
+        // can be greater or lower than the required len size
+        // it's up to the caller to check that
+        pub fn writable(b: *Self, len: usize) []const u8 {
+            if (b.r <= b.w) {
+                if ((b.w + len < b.buflen) // is there enough space at the end of the buffer
+                or (b.buflen - b.w >= b.r) // or wrapping is useless
+                ) {
+                    return b.buffer[b.w..];
                 }
-                self.r_pos = self.b_len;
-                self.r_len = len;
-                return self.reservedBuf();
+                // wrap writer position
+                b.h = b.w; // set hwm
+                b.w = 0;
             }
-
-            if (self.a_pos > 0) {
-                if (len + self.a_pos + self.a_len > self.buflen) {
-                    return Error.Overflow;
-                }
-                // reserve on top of a
-                self.r_pos = self.a_pos + self.a_len;
-                self.r_len = len;
-                return self.reservedBuf();
-            }
-            // reserve from the head
-            self.r_pos = 0;
-            self.r_len = len;
-            return self.reservedBuf();
+            return b.buffer[b.w..b.r];
         }
 
-        fn reservedBuf(self: *Self) []const u8 {
-            return self.buffer[self.r_pos .. self.r_pos + self.r_len];
+        // confirmation that len part of the writable buffer is written
+        pub fn written(b: *Self, len: usize) void {
+            b.w += len;
         }
 
-        fn resetReserved(self: *Self) void {
-            self.r_pos = 0;
-            self.r_len = 0;
+        // returns readable buffer part, zero size if there is nothing new
+        pub fn readable(b: *Self) []const u8 {
+            if (b.w >= b.r) {
+                return b.buffer[b.r..b.w];
+            }
+            if (b.r == b.h) {
+                b.r = 0; // wrap reader position
+                return b.buffer[b.r..b.w];
+            }
+            return b.buffer[b.r..b.h];
         }
 
-        pub fn writeCommit(len: usize) Error!void {
-            if (self.r_len < len) {
-                return Error.BadRequest;
-            }
-            defer self.resetReserved();
-
-            if (self.b_len > 0) {
-                self.b_len += len;
-                return;
-            }
-            self.a_len += len;
-        }
-
-        pub fn read() ?[]const u8 {
-            if (self.a_len == 0) {
-                return null;
-            }
-            return self.buffer[self.a_pos .. self.a_pos + self.a_len];
-        }
-
-        pub fn readCommit(len: usize) !void {
-            if (self.a_len < len) {
-                return Error.BadRequest;
-            }
-            self.a_pos += len;
-            self.a_len -= len;
-            if (self.a_len == 0) {
-                self.a_pos = 0;
-                if (self.b_len > 0) {
-                    // promote b to a
-                    self.a_len = self.b_len;
-                    self.b_len = 0;
-                }
-            }
+        // confirmation that the len part of the readable buffer is processed
+        pub fn read(b: *Self, len: usize) void {
+            b.r += len;
         }
     };
+}
+
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+
+test "w>r" {
+    const len = 128;
+    var b = BipBuffer(len){};
+    try expect(b.w == 0);
+    try expect(b.r == 0);
+    try expect(b.buflen == len);
+    try expect(b.h == len);
+
+    try expect(b.writable(10).len == 128);
+    try expect(b.writable(0).len == 128);
+    try expect(b.writable(256).len == 128);
+    try expect(b.readable().len == 0);
+
+    b.written(10);
+    try expect(b.w == 10);
+    try expect(b.r == 0);
+    try expect(b.h == len);
+    try expect(b.writable(10).len == 118);
+    try expect(b.writable(0).len == 118);
+    try expect(b.writable(256).len == 118);
+    try expect(b.readable().len == 10);
+
+    b.written(55);
+    try expect(b.w == 65);
+    try expect(b.r == 0);
+    try expect(b.h == len);
+    try expect(b.writable(10).len == 63);
+    try expect(b.readable().len == 65);
+
+    try expect(b.writable(64).len == 63);
+    try expect(b.writable(100).len == 63);
+    try expect(b.readable().len == 65);
+    b.read(15);
+    try expect(b.w == 65);
+    try expect(b.r == 15);
+    try expect(b.h == len);
+
+    try expect(b.readable().len == 50);
+    try expect(b.writable(100).len == 63);
+    b.read(50);
+    try expect(b.w == 65);
+    try expect(b.r == 65);
+    try expect(b.h == len);
+
+    // wrapping requested more then is free at the end
+    try expect(b.writable(64).len == 65);
+    try expect(b.w == 0);
+    try expect(b.r == 65);
+    try expect(b.h == 65);
+    try expect(b.readable().len == 0);
+    try expect(b.r == 0);
+
+    b.written(10);
+    try expect(b.w == 10);
+    try expect(b.r == 0);
+    try expect(b.h == 65);
+    try expect(b.readable().len == 10);
 }
