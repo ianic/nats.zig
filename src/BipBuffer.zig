@@ -26,38 +26,47 @@ pub fn init(buf: []u8) Self {
 // can be greater or lower than the required len size
 // it's up to the caller to check that
 pub fn writable(b: *Self, len: usize) []u8 {
-    if (b.r <= b.w) {
-        if ((b.w + len < b.buflen) // is there enough space at the end of the buffer
-        or (b.buflen - b.w >= b.r) // or wrapping is useless
+    var r = @atomicLoad(usize, &b.r, .SeqCst);
+    var w = @atomicLoad(usize, &b.w, .SeqCst);
+
+    if (r <= w) {
+        if ((w + len < b.buflen) // is there enough space at the end of the buffer
+        or (b.buflen - w >= r) // or wrapping is useless
         ) {
-            return b.buffer[b.w..];
+            return b.buffer[w..];
         }
         // wrap writer position
-        b.h = b.w; // set hwm
-        b.w = 0;
+        @atomicStore(usize, &b.h, w, .SeqCst); // b.h = b.w; // set hwm
+        w = 0;
+        @atomicStore(usize, &b.w, w, .SeqCst); // b.w = 0;
     }
-    return b.buffer[b.w..b.r];
+    return b.buffer[w..r];
 }
 
 // confirmation that len part of the writable buffer is written
 pub fn written(b: *Self, len: usize) void {
-    b.w += len;
+    _ = @atomicRmw(usize, &b.w, .Add, len, .SeqCst); // b.w += len
 }
 
 // returns readable buffer part, zero size if there is nothing new
 pub fn readable(b: *Self) []u8 {
-    if (b.r == b.h) {
-        b.r = 0; // wrap reader position
+    var r = @atomicLoad(usize, &b.r, .SeqCst);
+    var w = @atomicLoad(usize, &b.w, .SeqCst);
+    var h = @atomicLoad(usize, &b.h, .SeqCst);
+
+    if (r == h) {
+        r = 0;
+        @atomicStore(usize, &b.r, r, .SeqCst); // b.r = 0; // wrap reader position
     }
-    if (b.r <= b.w) {
-        return b.buffer[b.r..b.w];
+    if (r <= w) {
+        return b.buffer[r..w];
     }
-    return b.buffer[b.r..b.h];
+    return b.buffer[r..h];
 }
 
 // confirmation that the len part of the readable buffer is processed
 pub fn read(b: *Self, len: usize) void {
-    b.r += len;
+    _ = @atomicRmw(usize, &b.r, .Add, len, .SeqCst); //b.r += len;
 }
 
 const expect = std.testing.expect;
