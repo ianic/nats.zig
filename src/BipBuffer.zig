@@ -229,3 +229,54 @@ test "using with different buffer sizes" {
         alloc.free(buf);
     }
 }
+
+test "writer/reader thread synchonization" {
+    const Context = struct {
+        done: bool = false,
+        event: std.Thread.AutoResetEvent = std.Thread.AutoResetEvent{},
+        writes: u16 = 0,
+        reads: u16 = 0,
+
+        const RndGen = std.rand.DefaultPrng;
+        const Context = @This();
+
+        fn writer(self: *Context) !void {
+            var rnd = RndGen.init(@intCast(u64, std.time.timestamp()));
+
+            var i: u16 = 0;
+            while (i < 1024) : (i += 1) {
+                var rn = rnd.random().uintLessThan(u64, 128);
+                std.time.sleep(rn);
+                std.debug.print("+\n", .{});
+                self.writes += 1;
+                self.event.set();
+            }
+            @atomicStore(bool, &self.done, true, .SeqCst);
+        }
+
+        fn reader(self: *Context) !void {
+            var rnd = RndGen.init(@intCast(u64, std.time.timestamp()));
+
+            while (true) {
+                self.event.wait();
+                std.debug.print("-\n", .{});
+                self.reads += 1;
+                var rn = rnd.random().uintLessThan(u64, 128);
+                std.time.sleep(rn);
+                var done = @atomicLoad(bool, &self.done, .SeqCst);
+                if (done) {
+                    break;
+                }
+            }
+        }
+    };
+
+    var context = Context{};
+    const writer_thread = try std.Thread.spawn(.{}, Context.reader, .{&context});
+    const reader_thread = try std.Thread.spawn(.{}, Context.writer, .{&context});
+
+    writer_thread.join();
+    reader_thread.join();
+
+    std.debug.print("writes: {d}, reads: {d}\n", .{ context.writes, context.reads });
+}
