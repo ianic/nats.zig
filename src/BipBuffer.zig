@@ -40,7 +40,7 @@ pub fn writable(b: *Self, len: usize) []u8 {
         w = 0;
         @atomicStore(usize, &b.w, w, .SeqCst); // b.w = 0;
     }
-    return b.buffer[w..r];
+    return b.buffer[w..r-1];
 }
 
 // confirmation that len part of the writable buffer is written
@@ -54,14 +54,31 @@ pub fn readable(b: *Self) []u8 {
     var w = @atomicLoad(usize, &b.w, .SeqCst);
     var h = @atomicLoad(usize, &b.h, .SeqCst);
 
-    if (r == h) {
+    if (r == h and r > w) {
+        // wrap reader position
+        // b.h = buflen // reset hvm
+        if (@cmpxchgWeak(usize, &b.h, h, b.buflen, .SeqCst, .SeqCst)) |v| {
+            _ = v;
+            return b.buffer[0..0];
+        }
         r = 0;
         @atomicStore(usize, &b.r, r, .SeqCst); // b.r = 0; // wrap reader position
     }
     if (r <= w) {
         return b.buffer[r..w];
     }
-    return b.buffer[r..h];
+    if (r <= h) {
+        return b.buffer[r..h];
+    }
+    return b.buffer[0..0];
+}
+
+pub fn empty(b: *Self) bool {
+    var r = @atomicLoad(usize, &b.r, .SeqCst);
+    var w = @atomicLoad(usize, &b.w, .SeqCst);
+    var h = @atomicLoad(usize, &b.h, .SeqCst);
+
+    return r == w and h == b.buflen;
 }
 
 // confirmation that the len part of the readable buffer is processed
@@ -133,16 +150,16 @@ test "r>w" {
     b.r = 80;
     b.h = 100;
 
-    try expect(b.writable(50).len == 70);
-    try expect(b.writable(100).len == 70);
+    try expect(b.writable(50).len == 70-1);
+    try expect(b.writable(100).len == 70-1);
     try expect(b.readable().len == 20);
 
     b.written(20);
     try expect(b.w == 30);
     try expect(b.r == 80);
     try expect(b.h == 100);
-    try expect(b.writable(40).len == 50);
-    try expect(b.writable(100).len == 50);
+    try expect(b.writable(40).len == 50-1);
+    try expect(b.writable(100).len == 50-1);
     try expect(b.readable().len == 20);
 
     b.read(10);
@@ -160,7 +177,7 @@ test "r>w" {
     try expect(b.readable().len == 30);
     try expect(b.w == 30);
     try expect(b.r == 0);
-    try expect(b.h == 100);
+    try expect(b.h == 128);
 }
 
 test "wrapping" {
@@ -172,7 +189,7 @@ test "wrapping" {
     b.h = len;
 
     // writer wrap, requested more then there is at the right of the w
-    try expect(b.writable(64).len == 65);
+    try expect(b.writable(64).len == 65-1);
     try expect(b.w == 0);
     try expect(b.r == 65);
     try expect(b.h == 65);
@@ -184,25 +201,30 @@ test "wrapping" {
     b.written(10);
     try expect(b.w == 10);
     try expect(b.r == 0);
-    try expect(b.h == 65);
+    try expect(b.h == 128);
     try expect(b.readable().len == 10);
 }
 
 test "using with different buffer sizes" {
     const alloc = std.testing.allocator;
 
-    var i: usize = 5;
+    var i: usize = 6;
     while (i < 20) : (i += 1) {
         var buf = try alloc.alloc(u8, i);
         var b = init(buf);
+        defer alloc.free(buf);
 
         var j: usize = 0;
         while (j < 21) : (j += 1) {
+            //_ = b.readable();
+            //std.debug.print("w:{d} r:{d} h:{d}\n", .{ b.w, b.r, b.h });
             var wb = b.writable(3);
             try expect(wb.len >= 3);
             std.mem.copy(u8, wb, "123");
             b.written(3);
+            try expect(b.readable().len == 3);
 
+            //std.debug.print("w:{d} r:{d} h:{d}\n", .{ b.w, b.r, b.h });
             wb = b.writable(2);
             try expect(wb.len >= 2);
             std.mem.copy(u8, wb, "45");
@@ -225,8 +247,6 @@ test "using with different buffer sizes" {
                 b.read(2);
             }
         }
-
-        alloc.free(buf);
     }
 }
 
@@ -247,7 +267,7 @@ test "writer/reader thread synchonization" {
             while (i < 1024) : (i += 1) {
                 var rn = rnd.random().uintLessThan(u64, 128);
                 std.time.sleep(rn);
-                std.debug.print("+\n", .{});
+                //std.debug.print("+\n", .{});
                 self.writes += 1;
                 self.event.set();
             }
@@ -259,7 +279,7 @@ test "writer/reader thread synchonization" {
 
             while (true) {
                 self.event.wait();
-                std.debug.print("-\n", .{});
+                //std.debug.print("-\n", .{});
                 self.reads += 1;
                 var rn = rnd.random().uintLessThan(u64, 128);
                 std.time.sleep(rn);
@@ -279,4 +299,37 @@ test "writer/reader thread synchonization" {
     reader_thread.join();
 
     std.debug.print("writes: {d}, reads: {d}\n", .{ context.writes, context.reads });
+}
+
+fn bug_r_w_on_sam_pos() !void {
+    const len = 4;
+    var buf: [len]u8 = undefined;
+    var b = init(&buf);
+
+    try expect(b.w == 0);
+    try expect(b.r == 0);
+    try expect(b.h == 4);
+    try expect(b.writable(2).len == 4);
+    try expect(b.readable().len == 0);
+
+    b.written(2);
+    try expect(b.writable(2).len == 2);
+    try expect(b.readable().len == 2);
+    b.written(2);
+    try expect(b.writable(2).len == 0);
+    try expect(b.readable().len == 4);
+    b.read(2);
+    try expect(b.writable(2).len == 2);
+    try expect(b.readable().len == 2);
+    b.written(2);
+
+    try expect(b.w == 2);
+    try expect(b.r == 2);
+    try expect(b.h == 4);
+    try expect(b.readable().len == 0);
+
+}
+
+test "buf fix" {
+    try std.testing.expectError(error.TestUnexpectedResult, bug_r_w_on_sam_pos());
 }
