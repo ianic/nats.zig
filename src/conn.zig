@@ -15,16 +15,21 @@ const Info = Parser.Info;
 const OpErr = Parser.OpErr;
 
 const RingBuffer = @import("RingBuffer.zig").RingBuffer;
+const BipBuffer = @import("BipBuffer.zig");
 
 // constants
-const conn_read_buffer_size = 32768; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/nats.go#L479
 const max_args_len = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
 const op_read_buffer_size = 1024;
+const default_buffer_len = 32768; // The size of the bufio reader/writer on top of the socket.
+// ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/nats.go#L479
+
+// operations
 const cr_lf = "\r\n";
 const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
 const pong_op = "PONG\r\n";
 const ping_op = "PING\r\n";
 const inbox_prefix = "_INBOX.";
+// reconnect
 const max_reconnect: u8 = 60;
 const reconnect_wait = time.ns_per_s * 2;
 
@@ -80,6 +85,9 @@ const Error = error{
     MaxPayloadExceeded,
     ConnectionResetByPeer,
     ClientNotConnected,
+    WriteBufferOverflow,
+
+    Disconnected,
 };
 
 pub const Conn = struct {
@@ -100,10 +108,10 @@ pub const Conn = struct {
     err_op: ?OpErr = null,
     info: ?Info = null,
     status: Status = .disconnected,
-    write_mut: Thread.Mutex = Thread.Mutex{},
     read_buffer: ReadBuffer = ReadBuffer{},
     reader_trd: Thread = undefined,
     max_payload: u64 = 0,
+    writer: *Writer,
 
     fn connect(opt: ConnectOptions) !*Conn {
         var alloc = opt.alloc;
@@ -114,6 +122,7 @@ pub const Conn = struct {
             .alloc = alloc,
             .net_cli = null,
             .subs = try Subscriptions.init(alloc),
+            .writer = try Writer.init(alloc),
         };
         errdefer conn.deinit();
 
@@ -129,6 +138,7 @@ pub const Conn = struct {
         try client.connect(addr);
         errdefer client.deinit();
         self.net_cli = client;
+        self.writer.setCli(&self.net_cli.?);
     }
 
     fn reconnectLoop(self: *Self) !void {
@@ -160,7 +170,7 @@ pub const Conn = struct {
     fn resubscribe(self: *Self) !void {
         var iter = self.subs.iterator();
         while (iter.next()) |s| {
-            try self.write(self.op_builder.sub(s.subject, s.sid), null);
+            try self.writer.sub(s.subject, s.sid);
         }
     }
 
@@ -171,15 +181,16 @@ pub const Conn = struct {
         return Error.ClientNotConnected;
     }
 
-    fn netWrite(self: *Self, buf: []const u8) !void {
+    fn netSyncWrite(self: *Self, buf: []const u8) !void {
         if (self.net_cli) |c| {
             _ = c.write(buf, 0) catch |err| {
                 log.err("publish: {}", .{err});
                 self.netClose();
             };
             return;
+        } else {
+            return Error.Disconnected;
         }
-        return Error.ClientNotConnected;
     }
 
     fn netClose(self: *Self) void {
@@ -203,9 +214,9 @@ pub const Conn = struct {
         self.onInfo(op.info);
 
         // send CONNECT, PING
-        _ = try self.netWrite(connect_op);
+        _ = try self.netSyncWrite(connect_op);
         debugConnOut(connect_op);
-        _ = try self.netWrite(ping_op);
+        _ = try self.netSyncWrite(ping_op);
         debugConnOut(ping_op);
 
         // expect PONG
@@ -241,7 +252,7 @@ pub const Conn = struct {
         var parser = Parser.init(self.alloc);
         defer parser.deinit();
 
-        var buf: [conn_read_buffer_size]u8 = undefined;
+        var buf: [default_buffer_len]u8 = undefined;
         while (true) {
             var bytes_read = try self.netRead(buf[0..]);
             if (bytes_read == 0) {
@@ -292,36 +303,16 @@ pub const Conn = struct {
     }
 
     fn onPing(self: *Self) void {
-        self.write(pong_op, null) catch {};
-    }
-
-    fn write(self: *Self, op_buf: []const u8, data: ?[]const u8) !void {
-        if (data) |d| {
-            if (d.len > self.max_payload) {
-                return Error.MaxPayloadExceeded;
-            }
-        }
-        {
-            self.write_mut.lock();
-            defer self.write_mut.unlock();
-
-            _ = try self.netWrite(op_buf);
-            if (data) |d| {
-                _ = try self.netWrite(d);
-                _ = try self.netWrite(cr_lf);
-            }
-        }
-        debugConnOut(op_buf);
-        if (data) |d| {
-            debugConnOut(d);
-        }
+        self.writer.pong() catch {};
     }
 
     // publish message data on the subject
     // data is not copied
     pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
-        var op_buf = self.op_builder.pubOp(subject, data.len);
-        try self.write(op_buf, data);
+        if (data.len > self.max_payload) {
+            return Error.MaxPayloadExceeded;
+        }
+        try self.writer.publish(subject, data);
     }
 
     // subscribes handler to the subject
@@ -331,13 +322,13 @@ pub const Conn = struct {
         errdefer {
             self.subs.remove(sid);
         }
-        try self.write(self.op_builder.sub(subject, sid), null);
+        try self.writer.sub(subject, sid);
         return sid;
     }
 
     // use subscription id from subscribe to stop receiving messages
     pub fn unsubscribe(self: *Self, sid: u64) !void {
-        try self.write(self.op_builder.unsub(sid), null);
+        try self.writer.unsub(sid);
         self.subs.remove(sid);
     }
 
@@ -348,6 +339,7 @@ pub const Conn = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.writer.deinit();
         if (self.status == .connected) {
             self.close() catch {};
         }
@@ -559,3 +551,209 @@ fn logProtocolOp(prefix: []const u8, buf: []const u8) void {
     }
     log.debug("{s} {s}", .{ prefix, b });
 }
+
+const Writer = struct {
+    alloc: Allocator,
+    buffer: []u8,
+    bb: BipBuffer,
+    trd: Thread = undefined,
+    kicker: std.Thread.AutoResetEvent,
+    done: bool = false,
+    sent: usize = 0,
+    net_cli: ?*net.tcp.Client = null,
+    flush_mutex: Thread.Mutex = Thread.Mutex{},
+    publish_mutex: Thread.Mutex = Thread.Mutex{},
+    op_builder: OpBuilder = OpBuilder{},
+
+    const Self = @This();
+
+    pub fn init(alloc: Allocator) !*Self {
+        var buffer = try alloc.alloc(u8, default_buffer_len);
+
+        var writer = try alloc.create(Self);
+        writer.* = Self{
+            .alloc = alloc,
+            .buffer = buffer,
+            .bb = BipBuffer.init(buffer),
+            .kicker = std.Thread.AutoResetEvent{},
+        };
+        writer.trd = try Thread.spawn(.{}, Self.flushLoop, .{writer});
+        return writer;
+    }
+
+    pub fn setCli(self: *Self, cli: *net.tcp.Client) void {
+        @atomicStore(?*net.tcp.Client, &self.net_cli, cli, .SeqCst);
+    }
+
+    pub fn pong(self: *Self) !void {
+        try self.writeLock(pong_op, null);
+    }
+
+    pub fn sub(self: *Self, subject: []const u8, sid: u64) !void {
+        {
+            self.publish_mutex.lock();
+            defer self.publish_mutex.unlock();
+            var op_buf = self.op_builder.sub(subject, sid);
+            try self.writeNolock(op_buf, null);
+        }
+        self.kicker.set();
+    }
+
+    pub fn unsub(self: *Self, sid: u64) !void {
+        {
+            self.publish_mutex.lock();
+            defer self.publish_mutex.unlock();
+            var op_buf = self.op_builder.unsub(sid);
+            try self.writeNolock(op_buf, null);
+        }
+        self.kicker.set();
+    }
+
+    pub fn publish(self: *Self, subject: []const u8, data: []const u8) !void {
+        {
+            self.publish_mutex.lock();
+            defer self.publish_mutex.unlock();
+            var op_buf = self.op_builder.pubOp(subject, data.len);
+            try self.writeNolock(op_buf, data);
+        }
+        self.kicker.set();
+    }
+
+    fn writeLock(self: *Self, op_buf: []const u8, data: ?[]const u8) !void {
+        {
+            self.publish_mutex.lock();
+            defer self.publish_mutex.unlock();
+            try self.writeNolock(op_buf, data);
+        }
+        self.kicker.set();
+    }
+
+    fn writeNolock(self: *Self, op_buf: []const u8, data: ?[]const u8) !void {
+        var len = op_buf.len;
+        if (data) |d| {
+            len += d.len + 2;
+        }
+        var wb = self.bb.writable(len);
+        if (wb.len < len) {
+            {
+                std.debug.print("S", .{});
+                //log.info("flush from publish", .{});
+                // flush current bufer and make new bigger if needed
+                self.flush_mutex.lock();
+                defer self.flush_mutex.unlock();
+                try self.flush();
+                try self.ensureBufferSize(len);
+            }
+            wb = self.bb.writable(len);
+            if (wb.len < len) {
+                // buffer resize iz done we had to have enough space
+                unreachable;
+            }
+        } else {
+            //std.debug.print(".", .{});
+        }
+        // copy operation and data to the working buffer
+        std.mem.copy(u8, wb, op_buf);
+        if (data) |d| {
+            std.mem.copy(u8, wb[op_buf.len..], d);
+            std.mem.copy(u8, wb[op_buf.len + d.len ..], cr_lf);
+        }
+        self.bb.written(len); // commit
+    }
+
+    fn ensureBufferSize(self: *Self, len: usize) !void {
+        if (len * 8 < self.buffer.len) {
+            return;
+        }
+        var n_len = ((len * 16) / default_buffer_len) * default_buffer_len;
+
+        log.info("resize write buffer {} => {}", .{ self.buffer.len, n_len });
+        var buffer = try self.alloc.alloc(u8, n_len);
+        self.alloc.free(self.buffer);
+        self.buffer = buffer;
+        self.bb = BipBuffer.init(buffer);
+    }
+
+    fn flushLoop(self: *Self) void {
+        while (true) {
+            self.flush_mutex.lock();
+            self.flush() catch |err| {
+                log.err("flush error: {}", .{err});
+            };
+            self.flush_mutex.unlock();
+            //std.debug.print("F", .{});
+            if (@atomicLoad(bool, &self.done, .SeqCst)) {
+                break;
+            }
+            self.kicker.wait();
+        }
+    }
+
+    fn flush(self: *Self) !void {
+        if (@atomicLoad(?*net.tcp.Client, &self.net_cli, .SeqCst)) |cli| {
+            while (true) {
+                var buf = self.bb.readable();
+                if (buf.len == 0) {
+                    if (self.bb.empty()) {
+                        break;
+                    }
+                    continue;
+                }
+                var n = cli.write(buf, 0) catch |err| {
+                    self.netClose(cli);
+                    return err;
+                };
+                self.sent += n;
+                self.bb.read(n);
+            }
+        } else {
+            return Error.Disconnected;
+        }
+    }
+
+    fn netClose(self: *Self, cli: *net.tcp.Client) void {
+        cli.shutdown(.both) catch {};
+        // TODO store samo ako se nije promjenio
+        @atomicStore(?*net.tcp.Client, &self.net_cli, null, .SeqCst);
+    }
+
+    pub fn deinit(self: *Self) void {
+        @atomicStore(bool, &self.done, true, .SeqCst);
+        self.kicker.set();
+        self.trd.join();
+        self.alloc.free(self.buffer);
+        self.alloc.destroy(self);
+    }
+};
+
+// kako radi Go driver
+// - publish dodaje u buffer koji je 32k u startu fiksno ( nije konfigurabilno preko opts )
+//   dodaje s append, tako da ce ga prosiriti ako fali
+// - ako je taj buffer veci od limita sinkrono zove flush
+//   inace asinkrono kickFlusher
+//
+// - ako nema konekciju dodaje u pending buffer koji moze rasti do 8MB ( konfigurabilno )
+//   ako prekipi taj buffer onda vraca ErrReconnectBufExceeded
+//
+// - cijelo vrijeme drzi lock na cijeli connection
+//   svaki call na publish je lock
+//
+//
+// writeDirect - ono sto ja sada zovem writeSync
+
+// a kako cemo mi:
+// - krene s nekim buf
+//   ako je msg veci od buf: napravi novi buf i doda u njega, flush starog, baci stari uzmi novi
+//
+//  cini mi se da nije bitno imati dva normalni i pending
+//  samo jedan u njega stavlja i kada on prekipi radi flush, ako ima konekciju, ako nema vrati err
+//
+//  sto je rubni slucaj ... ide u resize, flush ne moze nema konekciju
+//    - napravi novi
+//    - kopiraj u novi
+//
+//  flush iz dva mjesta me vodi u lock ... ili u contition, sto je opet mutex,
+//  ima li smisla igrati se sa auto reset event, je li to stvarno brze od mutex
+//
+// mogu korisiti vise bufs u isto vrijeme ili uvijek samo jedan
+//
