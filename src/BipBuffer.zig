@@ -40,7 +40,7 @@ pub fn writable(b: *Self, len: usize) []u8 {
         w = 0;
         @atomicStore(usize, &b.w, w, .SeqCst); // b.w = 0;
     }
-    return b.buffer[w..r-1];
+    return b.buffer[w .. r - 1];
 }
 
 // confirmation that len part of the writable buffer is written
@@ -79,6 +79,20 @@ pub fn empty(b: *Self) bool {
     var h = @atomicLoad(usize, &b.h, .SeqCst);
 
     return r == w and h == b.buflen;
+}
+
+pub fn copy(dst: *Self, src: *Self) void {
+    while (!src.empty()) {
+        var src_buf = src.readable();
+        var ln = src_buf.len;
+        var dst_buf = dst.writable(ln);
+        if (dst_buf.len < ln) {
+            unreachable;
+        }
+        std.mem.copy(u8, dst_buf, src_buf);
+        dst.written(ln);
+        src.read(ln);
+    }
 }
 
 // confirmation that the len part of the readable buffer is processed
@@ -150,16 +164,16 @@ test "r>w" {
     b.r = 80;
     b.h = 100;
 
-    try expect(b.writable(50).len == 70-1);
-    try expect(b.writable(100).len == 70-1);
+    try expect(b.writable(50).len == 70 - 1);
+    try expect(b.writable(100).len == 70 - 1);
     try expect(b.readable().len == 20);
 
     b.written(20);
     try expect(b.w == 30);
     try expect(b.r == 80);
     try expect(b.h == 100);
-    try expect(b.writable(40).len == 50-1);
-    try expect(b.writable(100).len == 50-1);
+    try expect(b.writable(40).len == 50 - 1);
+    try expect(b.writable(100).len == 50 - 1);
     try expect(b.readable().len == 20);
 
     b.read(10);
@@ -189,7 +203,7 @@ test "wrapping" {
     b.h = len;
 
     // writer wrap, requested more then there is at the right of the w
-    try expect(b.writable(64).len == 65-1);
+    try expect(b.writable(64).len == 65 - 1);
     try expect(b.w == 0);
     try expect(b.r == 65);
     try expect(b.h == 65);
@@ -327,9 +341,24 @@ fn bug_r_w_on_sam_pos() !void {
     try expect(b.r == 2);
     try expect(b.h == 4);
     try expect(b.readable().len == 0);
-
 }
 
 test "buf fix" {
     try std.testing.expectError(error.TestUnexpectedResult, bug_r_w_on_sam_pos());
+}
+
+test "copy" {
+    var buf: [4]u8 = undefined;
+    var b = init(&buf);
+    var wb = b.writable(3);
+    std.mem.copy(u8, wb, "123");
+    b.written(3);
+
+    var buf2: [8]u8 = undefined;
+    var b2 = init(&buf2);
+    b2.copy(&b);
+
+    var wb2 = b2.readable();
+    try expect(wb2.len == 3);
+    try expect(std.mem.eql(u8, wb2, "123"));
 }

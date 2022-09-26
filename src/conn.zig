@@ -20,8 +20,8 @@ const BipBuffer = @import("BipBuffer.zig");
 // constants
 const max_args_len = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
 const op_read_buffer_size = 1024;
-const default_buffer_len = 32768; // The size of the bufio reader/writer on top of the socket.
-// ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/nats.go#L479
+const default_buffer_len = 32768; // The size of the bufio reader/writer on top of the socket. ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/nats.go#L479
+const max_buffer_len = 8 * 1024 * 1024; // 8Mb
 
 // operations
 const cr_lf = "\r\n";
@@ -85,8 +85,7 @@ const Error = error{
     MaxPayloadExceeded,
     ConnectionResetByPeer,
     ClientNotConnected,
-    WriteBufferOverflow,
-
+    WriteBufferExceeded,
     Disconnected,
 };
 
@@ -636,13 +635,17 @@ const Writer = struct {
         var wb = self.bb.writable(len);
         if (wb.len < len) {
             {
-                std.debug.print("S", .{});
+                //std.debug.print("S", .{});
                 //log.info("flush from publish", .{});
                 // flush current bufer and make new bigger if needed
                 self.flush_mutex.lock();
                 defer self.flush_mutex.unlock();
-                try self.flush();
-                try self.ensureBufferSize(len);
+
+                self.flush() catch {};
+                wb = self.bb.writable(len);
+                if (wb.len < len) {
+                    try self.ensureFree(len);
+                }
             }
             wb = self.bb.writable(len);
             if (wb.len < len) {
@@ -650,7 +653,7 @@ const Writer = struct {
                 unreachable;
             }
         } else {
-            //std.debug.print(".", .{});
+            std.debug.print(".", .{});
         }
         // copy operation and data to the working buffer
         std.mem.copy(u8, wb, op_buf);
@@ -661,24 +664,30 @@ const Writer = struct {
         self.bb.written(len); // commit
     }
 
-    fn ensureBufferSize(self: *Self, len: usize) !void {
-        if (len * 8 < self.buffer.len) {
-            return;
+    fn ensureFree(self: *Self, len: usize) !void {
+        var n_len = self.buffer.len * 2;
+        if (len > self.buffer.len) {
+            n_len = (len * 2 / default_buffer_len + 1) * default_buffer_len; // round to default_buffer_len
         }
-        var n_len = ((len * 16) / default_buffer_len) * default_buffer_len;
-
+        if (n_len > max_buffer_len) {
+            return Error.WriteBufferExceeded;
+        }
         log.info("resize write buffer {} => {}", .{ self.buffer.len, n_len });
         var buffer = try self.alloc.alloc(u8, n_len);
+        var n_bb = BipBuffer.init(buffer);
+        n_bb.copy(self.bb);
+        self.bb = n_bb;
         self.alloc.free(self.buffer);
         self.buffer = buffer;
-        self.bb = BipBuffer.init(buffer);
     }
 
     fn flushLoop(self: *Self) void {
         while (true) {
             self.flush_mutex.lock();
             self.flush() catch |err| {
-                log.err("flush error: {}", .{err});
+                if (err != Error.Disconnected) {
+                    log.err("flush error: {}", .{err});
+                }
             };
             self.flush_mutex.unlock();
             //std.debug.print("F", .{});
@@ -700,6 +709,7 @@ const Writer = struct {
                     continue;
                 }
                 var n = cli.write(buf, 0) catch |err| {
+                    //log.warn("cli write for buf: {s}", .{buf});
                     self.netClose(cli);
                     return err;
                 };
