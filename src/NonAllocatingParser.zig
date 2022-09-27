@@ -26,7 +26,7 @@ pub const Operation = union(OperationTag) {
     info: Info,
     /// `MSG <subject> <#sid> [reply-to] <#bytes>\r\n[payload]\r\n`
     msg: Msg,
-    /// `HMSG <subject> <#sid> [reply-to] <#header-bytes> <#total-bytes>\r\n<version-line>\r\n[headers]\r\n\r\n[payload]\r\n`
+    /// `HMSG <subject> <#sid> [reply-to] <#header-bytes> <#total-bytes>\r\n<version-line>\r\n[header]\r\n\r\n[payload]\r\n`
     hmsg: Msg,
     /// `-ERR <error message>`
     err: Err,
@@ -49,8 +49,7 @@ pub const Err = struct {
 pub const Msg = struct {
     subject: []const u8,
     sid: u64, // subscription id
-    reply_to: ?[]const u8,
-    size: u64,
+    reply_to: ?[]const u8 = null,
     payload: ?[]const u8 = null,
     header: ?[]const u8 = null,
 };
@@ -91,9 +90,10 @@ pub fn unparsed(self: *Self) []const u8 {
 }
 
 fn readMsg(self: *Self) !Operation {
-    var msg = try self.msgArgs();
-    if (msg.size > 0) {
-        const payload_end = self.index + msg.size;
+    var arg = try self.msgArgs();
+    var msg = arg.msg;
+    if (arg.payload_size > 0) {
+        const payload_end = self.index + arg.payload_size;
         if (self.source.len < payload_end) {
             return Error.SplitBuffer;
         }
@@ -104,15 +104,15 @@ fn readMsg(self: *Self) !Operation {
 }
 
 fn readHmsg(self: *Self) !Operation {
-    var hmsg = try self.hmsgArgs();
-    var msg = hmsg.msg;
-    if (msg.size > 0) {
-        const payload_end = self.index + msg.size;
+    var arg = try self.hmsgArgs();
+    var msg = arg.msg;
+    if (arg.payload_size > 0) {
+        const payload_end = self.index + arg.payload_size;
         if (self.source.len < payload_end) {
             return Error.SplitBuffer;
         }
-        msg.header = self.source[self.index .. self.index + hmsg.header_size];
-        msg.payload = self.source[self.index + hmsg.header_size .. payload_end];
+        msg.header = self.source[self.index .. self.index + arg.header_size];
+        msg.payload = self.source[self.index + arg.header_size .. payload_end];
         self.index = payload_end;
     }
     return Operation{ .hmsg = msg };
@@ -334,63 +334,54 @@ fn eatNewLine(self: *Self) void {
     }
 }
 
-fn msgArgs(self: *Self) !Msg {
+const MsgArgs = struct {
+    msg: Msg,
+    payload_size: usize = 0,
+    header_size: usize = 0,
+};
+
+fn msgArgs(self: *Self) !MsgArgs {
     const a1 = try self.findArg();
     const a2 = try self.findArg();
     const a3 = try self.findArg();
     const a4 = try self.findArg();
-    var msg = Msg{
+    var arg = MsgArgs{ .msg = Msg{
         .subject = self.source[a1.start..a1.end],
         .sid = try std.fmt.parseUnsigned(u64, self.source[a2.start..a2.end], 10),
-        .size = 0,
-        .reply_to = null,
-        .payload = null,
-    };
+    } };
     if (a4.empty()) {
-        msg.size = try std.fmt.parseUnsigned(u64, self.source[a3.start..a3.end], 10);
+        arg.payload_size = try std.fmt.parseUnsigned(u64, self.source[a3.start..a3.end], 10);
     } else {
-        msg.reply_to = self.source[a3.start..a3.end];
-        msg.size = try std.fmt.parseUnsigned(u64, self.source[a4.start..a4.end], 10);
+        arg.msg.reply_to = self.source[a3.start..a3.end];
+        arg.payload_size = try std.fmt.parseUnsigned(u64, self.source[a4.start..a4.end], 10);
     }
     self.eatNewLine();
-    return msg;
+    return arg;
 }
 
-const Hmsg = struct {
-    msg: Msg,
-    header_size: usize,
-};
-
-fn hmsgArgs(self: *Self) !Hmsg {
+fn hmsgArgs(self: *Self) !MsgArgs {
     const a1 = try self.findArg();
     const a2 = try self.findArg();
     const a3 = try self.findArg();
     const a4 = try self.findArg();
     const a5 = try self.findArg();
-    var msg = Msg{
+    var arg = MsgArgs{ .msg = Msg{
         .subject = self.source[a1.start..a1.end],
         .sid = try std.fmt.parseUnsigned(u64, self.source[a2.start..a2.end], 10),
-        .size = 0,
-        .reply_to = null,
-        .payload = null,
-    };
-    var header_size: usize = 0;
+    } };
     if (a5.empty()) {
-        header_size = try std.fmt.parseUnsigned(u64, self.source[a3.start..a3.end], 10);
-        msg.size = try std.fmt.parseUnsigned(u64, self.source[a4.start..a4.end], 10);
+        arg.header_size = try std.fmt.parseUnsigned(u64, self.source[a3.start..a3.end], 10);
+        arg.payload_size = try std.fmt.parseUnsigned(u64, self.source[a4.start..a4.end], 10);
     } else {
-        msg.reply_to = self.source[a3.start..a3.end];
-        header_size = try std.fmt.parseUnsigned(u64, self.source[a4.start..a4.end], 10);
-        msg.size = try std.fmt.parseUnsigned(u64, self.source[a5.start..a5.end], 10);
+        arg.msg.reply_to = self.source[a3.start..a3.end];
+        arg.header_size = try std.fmt.parseUnsigned(u64, self.source[a4.start..a4.end], 10);
+        arg.payload_size = try std.fmt.parseUnsigned(u64, self.source[a5.start..a5.end], 10);
     }
-    if (msg.size < header_size) {
+    if (arg.payload_size < arg.header_size) {
         return Error.BadHeaderSize;
     }
     self.eatNewLine();
-    return Hmsg{
-        .msg = msg,
-        .header_size = header_size,
-    };
+    return arg;
 }
 
 // testing imports
@@ -498,7 +489,6 @@ test "MSG operation" {
         try expect(op == .msg);
         try expectEqualStrings("subject", op.msg.subject);
         try expectEqual(op.msg.sid, 123);
-        try expectEqual(op.msg.size, 3);
         try expectEqual(op.msg.payload.?.len, 3);
         try expectEqualStrings("123", op.msg.payload.?);
         try expectEqual(parser.parsed_index, buf.len);
@@ -513,7 +503,6 @@ test "MSG without payload" {
     try expect(op == .msg);
     try expectEqualStrings("subject", op.msg.subject);
     try expectEqual(op.msg.sid, 123);
-    try expectEqual(op.msg.size, 0);
     try expectEqual(op.msg.payload, null);
     const op2 = try parser.next();
     try expect(op2 == .ping);
@@ -527,7 +516,6 @@ test "MSG with reply" {
     try expect(op == .msg);
     try expectEqualStrings("bar.foo", op.msg.subject);
     try expectEqual(op.msg.sid, 10);
-    try expectEqual(op.msg.size, 12);
     try expectEqual(op.msg.payload.?.len, 12);
     try expectEqualStrings("INBOX.34", op.msg.reply_to.?);
     try expectEqualStrings("012345678901", op.msg.payload.?);
@@ -581,5 +569,6 @@ test "HMSG operation" {
     try expectEqualStrings("hello world", op.hmsg.payload.?);
     try expectEqualStrings("OK:", op.hmsg.header.?);
     try expectEqualStrings("foo.bar", op.hmsg.subject);
+    try expectEqualStrings("INBOX.22", op.hmsg.reply_to.?);
     try expectEqual(op.hmsg.sid, 123);
 }
