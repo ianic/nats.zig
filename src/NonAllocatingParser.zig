@@ -5,51 +5,45 @@ const Self = @This();
 pub const Error = error{
     SplitBuffer,
     UnexpectedToken,
-
-    // TODO those below are still unused
-    //UnsupportedOperation,
-    MissingArguments,
-    UnexpectedMsgArgs,
-    ArgsTooLong,
-    BufferNotConsumed,
-    OpNotFound,
 };
 
-// protocol operation names
+// Protocol operation tags
 // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#protocol-messages
-const OperationToken = enum {
+const OperationTag = enum {
     // sent by server
     info,
     msg,
+    hmsg,
     ok,
     err,
-    // sent by client
-    connect,
-    @"pub",
-    sub,
-    unsub,
     // sent by both client and server
     ping,
     pong,
-    // currently unsupported
-    hmsg,
 };
 
-// protocol operations
-pub const Operation = union(OperationToken) {
+// Protocol operations
+pub const Operation = union(OperationTag) {
+    /// `INFO {["option_name":option_value],...}`
     info: Info,
+
+    /// `MSG <subject> <sid> [reply-to] <#bytes>\r\n
+    /// [payload]\r\n`
     msg: Msg,
+
+    /// `OK`
     ok,
+
+    /// `-ERR <error message>`
     err: Err,
 
-    connect,
-    @"pub",
-    sub,
-    unsub,
-
+    /// `PING`
     ping,
+
+    /// `PONG`
     pong,
 
+    /// `HMSG <subject> <sid> [reply-to] <# header bytes> <# total bytes>\r\n
+    /// <version line>\r\n[headers]\r\n\r\n[payload]\r\n`
     hmsg,
 };
 
@@ -70,8 +64,10 @@ pub const Msg = struct {
 };
 
 source: []const u8, // buffer which we are parsing
-parsed_index: usize = 0, // part of the source buffer which is pared into opertations
 index: usize = 0, // current parser position in source
+
+parsed_index: usize = 0, // part of the source buffer which is parsed into opertations
+operations: usize = 0,
 
 pub fn init(source: []const u8) Self {
     return Self{
@@ -80,33 +76,42 @@ pub fn init(source: []const u8) Self {
 }
 
 pub fn next(self: *Self) !Operation {
-    const tag = try self.operation();
+    const tag = try self.readOperation();
+    self.index += 1; // we are now on the whitespace, move forward
+
     const op: Operation = switch (tag) {
         .ping => Operation.ping,
         .pong => Operation.pong,
         .ok => Operation.ok,
-        .err => Operation{ .err = Err{ .args = try self.argsLine() } },
-        .info => Operation{ .info = Info{ .args = try self.argsLine() } },
-        .msg => blk: {
-            var msg = try self.msgArgs();
-            if (msg.size > 0) {
-                const payload_end = self.index + msg.size;
-                if (self.source.len < payload_end) {
-                    return Error.SplitBuffer;
-                }
-                msg.payload = self.source[self.index..payload_end];
-                self.index = payload_end;
-            }
-            break :blk Operation{ .msg = msg };
-        },
+        .err => Operation{ .err = Err{ .args = try self.readArgs() } },
+        .info => Operation{ .info = Info{ .args = try self.readArgs() } },
+        .msg => try self.readMsg(),
         else => unreachable,
     };
     self.eatNewLine();
     self.parsed_index = self.index;
+    self.operations += 1;
     return op;
 }
 
-pub fn operation(self: *Self) !OperationToken {
+pub fn unparsed(self: *Self) []const u8 {
+    return self.source[self.parsed_index..];
+}
+
+fn readMsg(self: *Self) !Operation {
+    var msg = try self.msgArgs();
+    if (msg.size > 0) {
+        const payload_end = self.index + msg.size;
+        if (self.source.len < payload_end) {
+            return Error.SplitBuffer;
+        }
+        msg.payload = self.source[self.index..payload_end];
+        self.index = payload_end;
+    }
+    return Operation{ .msg = msg };
+}
+
+fn readOperation(self: *Self) !OperationTag {
     // parser states
     const State = enum {
         start,
@@ -114,8 +119,6 @@ pub fn operation(self: *Self) !OperationToken {
         in,
         inf,
         info,
-        //info_, // info operation and space 'INFO '
-        //info_args, // info operation arguments
         p,
         pi,
         pin,
@@ -127,14 +130,9 @@ pub fn operation(self: *Self) !OperationToken {
         e,
         er,
         err,
-        //err_,
-        //err_args,
         m,
         ms,
         msg,
-        //msg_,
-        //msg_args,
-        //msg_payload,
         plus,
         o,
         ok,
@@ -176,7 +174,7 @@ pub fn operation(self: *Self) !OperationToken {
             },
             .ping => {
                 switch (b) {
-                    '\n' => return OperationToken.ping, // found ping operation
+                    '\n' => return OperationTag.ping, // found ping operation
                     else => {},
                 }
             },
@@ -194,7 +192,7 @@ pub fn operation(self: *Self) !OperationToken {
             },
             .pong => {
                 switch (b) {
-                    '\n' => return OperationToken.pong, // found pong operation
+                    '\n' => return OperationTag.pong, // found pong operation
                     else => {},
                 }
             },
@@ -218,7 +216,7 @@ pub fn operation(self: *Self) !OperationToken {
             },
             .info => {
                 switch (b) {
-                    ' ', '\t' => return OperationToken.info, // found info operation
+                    ' ', '\t' => return OperationTag.info, // found info operation
                     else => return Error.UnexpectedToken,
                 }
             },
@@ -242,7 +240,7 @@ pub fn operation(self: *Self) !OperationToken {
             },
             .err => {
                 switch (b) {
-                    ' ', '\t' => return OperationToken.err, // found err operation
+                    ' ', '\t' => return OperationTag.err, // found err operation
                     else => return Error.UnexpectedToken,
                 }
             },
@@ -260,7 +258,7 @@ pub fn operation(self: *Self) !OperationToken {
             },
             .ok => {
                 switch (b) {
-                    '\n' => return OperationToken.ok,
+                    '\n' => return OperationTag.ok,
                     else => {},
                 }
             },
@@ -278,7 +276,7 @@ pub fn operation(self: *Self) !OperationToken {
             },
             .msg => {
                 switch (b) {
-                    ' ', '\t' => return OperationToken.msg, // found msg operation
+                    ' ', '\t' => return OperationTag.msg, // found msg operation
                     else => return Error.UnexpectedToken,
                 }
             },
@@ -287,21 +285,11 @@ pub fn operation(self: *Self) !OperationToken {
     return Error.SplitBuffer;
 }
 
-pub fn skipWhitespace(self: *Self) void {
-    while (self.index < self.source.len) : (self.index += 1) {
-        const b = self.source[self.index];
-        switch (b) {
-            ' ', '\t' => {},
-            else => return,
-        }
-    }
-}
-
-pub const Loc = struct {
+const Loc = struct {
     start: usize = 0,
     end: usize = 0,
 
-    pub fn empty(self: Loc) bool {
+    fn empty(self: Loc) bool {
         return self.start == self.end;
     }
 };
@@ -334,9 +322,9 @@ fn findArgsLine(self: *Self) !Loc {
     return Error.SplitBuffer;
 }
 
-fn argsLine(self: *Self) ![]const u8 {
-    const a = try self.findArgsLine();
-    return self.source[a.start..a.end];
+fn readArgs(self: *Self) ![]const u8 {
+    const l = try self.findArgsLine();
+    return self.source[l.start..l.end];
 }
 
 // from current location to the next whitespace (or end of line)
@@ -412,9 +400,10 @@ test "PING operation" {
         var parser = init(buf);
         const op = try parser.next();
         try expect(op == .ping);
-        try expect(op == OperationToken.ping);
-        try expect(@as(OperationToken, op) == OperationToken.ping);
+        try expect(op == OperationTag.ping);
+        try expect(@as(OperationTag, op) == OperationTag.ping);
         try expectEqual(parser.parsed_index, buf.len);
+        try expect(parser.unparsed().len == 0);
     }
 }
 
@@ -428,6 +417,7 @@ test "PONG operation" {
         var parser = init(buf);
         const op = try parser.next();
         try expect(op == .pong);
+        try expect(parser.unparsed().len == 0);
     }
 }
 
@@ -441,13 +431,13 @@ test "ERR operation" {
         var parser = init(buf);
         const op = try parser.next();
         try expect(op == .err);
-
         switch (i) {
             0 => try expect(mem.eql(u8, "'Stale Connection'", op.err.args)),
             1 => try expect(mem.eql(u8, "'Unknown Protocol Operation'", op.err.args)),
             2 => try expect(mem.eql(u8, "'Permissions Violation for Subscription to foo.bar'\t", op.err.args)),
             else => {},
         }
+        try expect(parser.unparsed().len == 0);
     }
 }
 
@@ -463,7 +453,7 @@ test "INFO operation" {
         var parser = init(buf);
         const op = try parser.next();
         try expect(op == .info);
-
+        try expect(parser.unparsed().len == 0);
         try expectEqualStrings(
             try std.fmt.bufPrint(printBuf[0..], "{{\"proto\":{d}}}", .{i}),
             op.info.args,
@@ -501,6 +491,7 @@ test "MSG operation" {
         try expectEqual(op.msg.payload.?.len, 3);
         try expectEqualStrings("123", op.msg.payload.?);
         try expectEqual(parser.parsed_index, buf.len);
+        try expect(parser.unparsed().len == 0);
     }
 }
 
@@ -515,6 +506,7 @@ test "MSG without payload" {
     try expectEqual(op.msg.payload, null);
     const op2 = try parser.next();
     try expect(op2 == .ping);
+    try expect(parser.unparsed().len == 0);
 }
 
 test "MSG with reply" {
@@ -530,6 +522,7 @@ test "MSG with reply" {
     try expectEqualStrings("012345678901", op.msg.payload.?);
     try expectEqual(parser.parsed_index, buf.len);
     try expectEqual(buf[parser.parsed_index..].len, 0);
+    try expect(parser.unparsed().len == 0);
 }
 
 test "split buffer" {
@@ -537,9 +530,10 @@ test "split buffer" {
         buf: []const u8,
         ops: usize,
         parsed_index: usize,
+        unparsed: []const u8,
     }{
-        .{ .buf = "PING\nPONG\nMSG subject ", .ops = 2, .parsed_index = 10 },
-        .{ .buf = "PING\nPONG\n-err \nMSG subject 123 ", .ops = 3, .parsed_index = 16 },
+        .{ .buf = "PING\nPONG\nMSG subject ", .ops = 2, .parsed_index = 10, .unparsed = "MSG subject " },
+        .{ .buf = "PING\nPONG\n-err \nMSG subject 123 ", .ops = 3, .parsed_index = 16, .unparsed = "MSG subject 123 " },
     };
 
     for (cases) |c| {
@@ -552,8 +546,7 @@ test "split buffer" {
         try expectError(Error.SplitBuffer, err);
         try expectEqual(c.parsed_index, parser.parsed_index);
         try expectEqualStrings("MSG", c.buf[parser.parsed_index .. parser.parsed_index + 3]);
+        try expectEqualStrings(c.unparsed, parser.unparsed());
+        try expectEqual(c.ops, parser.operations);
     }
 }
-
-// what's the biggest message size
-// unparsed part of the buffer function to return that
