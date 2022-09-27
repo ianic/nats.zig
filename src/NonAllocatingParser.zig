@@ -1,3 +1,12 @@
+// Non allocating because all []const u8 values are slices of the underlying
+// source buffer. They are not copies. Source buffer can't bee overwritten
+// until operation is consumed.
+//
+// In the case when there is incomplete message in the source buffer SplitBuffer
+// error is returned. Caller should copy unprocessed part of the buffer (from
+// parsed_index to end) to the start of the new buffer and then append rest
+// of the operation to that new buffer.
+
 const std = @import("std");
 
 const Self = @This();
@@ -56,9 +65,13 @@ pub const Msg = struct {
 
 source: []const u8, // buffer which we are parsing
 index: usize = 0, // current parser position in source
-
 parsed_index: usize = 0, // part of the source buffer which is parsed into opertations
-operations: usize = 0,
+// statistic information
+stat: struct {
+    operations: usize = 0, // number of parsed operations
+    bytes: usize = 0, // parsed bytes so far
+    msgs: usize = 0, // number of parsed mesages
+} = .{},
 
 pub fn init(source: []const u8) Self {
     return Self{
@@ -66,7 +79,14 @@ pub fn init(source: []const u8) Self {
     };
 }
 
+pub fn reInit(self: *Self, source: []const u8) void {
+    self.source = source;
+    self.index = 0;
+    self.parsed_index = 0;
+}
+
 pub fn next(self: *Self) !Operation {
+    const start_index = self.index;
     const tag = try self.readOperation();
     self.index += 1; // we are now on the whitespace, move forward
 
@@ -81,7 +101,12 @@ pub fn next(self: *Self) !Operation {
     };
     self.eatNewLine();
     self.parsed_index = self.index;
-    self.operations += 1;
+
+    self.stat.operations += 1;
+    self.stat.bytes += self.index - start_index;
+    if (op == .msg or op == .hmsg) {
+        self.stat.msgs += 1;
+    }
     return op;
 }
 
@@ -522,6 +547,10 @@ test "MSG with reply" {
     try expectEqual(parser.parsed_index, buf.len);
     try expectEqual(buf[parser.parsed_index..].len, 0);
     try expect(parser.unparsed().len == 0);
+
+    try expectEqual(parser.stat.operations, 1);
+    try expectEqual(parser.stat.msgs, 1);
+    try expectEqual(parser.stat.bytes, buf.len);
 }
 
 test "split buffer" {
@@ -546,7 +575,7 @@ test "split buffer" {
         try expectEqual(c.parsed_index, parser.parsed_index);
         try expectEqualStrings("MSG", c.buf[parser.parsed_index .. parser.parsed_index + 3]);
         try expectEqualStrings(c.unparsed, parser.unparsed());
-        try expectEqual(c.ops, parser.operations);
+        try expectEqual(c.ops, parser.stat.operations);
     }
 }
 

@@ -1,4 +1,4 @@
-fconst std = @import("std");
+const std = @import("std");
 const assert = std.debug.assert;
 const net = std.x.net;
 const fmt = std.fmt;
