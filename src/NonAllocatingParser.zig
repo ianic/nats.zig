@@ -5,18 +5,17 @@ const Self = @This();
 pub const Error = error{
     SplitBuffer,
     UnexpectedToken,
+    BadHeaderSize,
 };
 
 // Protocol operation tags
 // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#protocol-messages
 const OperationTag = enum {
-    // sent by server
     info,
     msg,
     hmsg,
-    ok,
     err,
-    // sent by both client and server
+    ok,
     ping,
     pong,
 };
@@ -25,26 +24,18 @@ const OperationTag = enum {
 pub const Operation = union(OperationTag) {
     /// `INFO {["option_name":option_value],...}`
     info: Info,
-
-    /// `MSG <subject> <sid> [reply-to] <#bytes>\r\n
-    /// [payload]\r\n`
+    /// `MSG <subject> <#sid> [reply-to] <#bytes>\r\n[payload]\r\n`
     msg: Msg,
-
-    /// `OK`
-    ok,
-
+    /// `HMSG <subject> <#sid> [reply-to] <#header-bytes> <#total-bytes>\r\n<version-line>\r\n[headers]\r\n\r\n[payload]\r\n`
+    hmsg: Msg,
     /// `-ERR <error message>`
     err: Err,
-
+    /// `OK`
+    ok,
     /// `PING`
     ping,
-
     /// `PONG`
     pong,
-
-    /// `HMSG <subject> <sid> [reply-to] <# header bytes> <# total bytes>\r\n
-    /// <version line>\r\n[headers]\r\n\r\n[payload]\r\n`
-    hmsg,
 };
 
 pub const Info = struct {
@@ -58,9 +49,10 @@ pub const Err = struct {
 pub const Msg = struct {
     subject: []const u8,
     sid: u64, // subscription id
-    reply: ?[]const u8,
+    reply_to: ?[]const u8,
     size: u64,
     payload: ?[]const u8 = null,
+    header: ?[]const u8 = null,
 };
 
 source: []const u8, // buffer which we are parsing
@@ -86,7 +78,7 @@ pub fn next(self: *Self) !Operation {
         .err => Operation{ .err = Err{ .args = try self.readArgs() } },
         .info => Operation{ .info = Info{ .args = try self.readArgs() } },
         .msg => try self.readMsg(),
-        else => unreachable,
+        .hmsg => try self.readHmsg(),
     };
     self.eatNewLine();
     self.parsed_index = self.index;
@@ -109,6 +101,21 @@ fn readMsg(self: *Self) !Operation {
         self.index = payload_end;
     }
     return Operation{ .msg = msg };
+}
+
+fn readHmsg(self: *Self) !Operation {
+    var hmsg = try self.hmsgArgs();
+    var msg = hmsg.msg;
+    if (msg.size > 0) {
+        const payload_end = self.index + msg.size;
+        if (self.source.len < payload_end) {
+            return Error.SplitBuffer;
+        }
+        msg.header = self.source[self.index .. self.index + hmsg.header_size];
+        msg.payload = self.source[self.index + hmsg.header_size .. payload_end];
+        self.index = payload_end;
+    }
+    return Operation{ .hmsg = msg };
 }
 
 fn readOperation(self: *Self) !OperationTag {
@@ -136,151 +143,117 @@ fn readOperation(self: *Self) !OperationTag {
         plus,
         o,
         ok,
+        h,
     };
     var state: State = .start;
+    var hmsg = false;
 
     while (self.index < self.source.len) : (self.index += 1) {
-        const b = self.source[self.index];
-        switch (state) {
-            .start => {
-                switch (b) {
-                    '\r', '\n' => {},
-                    'I', 'i' => state = .i,
-                    'P', 'p' => state = .p,
-                    'M', 'm' => state = .m,
-                    '-' => state = .minus,
-                    '+' => state = .plus,
-                    else => return Error.UnexpectedToken,
-                }
+        const c = self.source[self.index];
+        state = switch (state) {
+            .start => switch (c) {
+                '\r', '\n' => .start,
+                'I', 'i' => .i,
+                'P', 'p' => .p,
+                'M', 'm' => .m,
+                'H', 'h' => blk: {
+                    hmsg = true;
+                    break :blk .h;
+                },
+                '-' => .minus,
+                '+' => .plus,
+                else => return Error.UnexpectedToken,
             },
-            .p => {
-                switch (b) {
-                    'I', 'i' => state = .pi,
-                    'O', 'o' => state = .po,
-                    else => return Error.UnexpectedToken,
-                }
+            .p => switch (c) {
+                'I', 'i' => .pi,
+                'O', 'o' => .po,
+                else => return Error.UnexpectedToken,
             },
-            .pi => {
-                switch (b) {
-                    'N', 'n' => state = .pin,
-                    else => return Error.UnexpectedToken,
-                }
+            .pi => switch (c) {
+                'N', 'n' => .pin,
+                else => return Error.UnexpectedToken,
             },
-            .pin => {
-                switch (b) {
-                    'G', 'g' => state = .ping,
-                    else => return Error.UnexpectedToken,
-                }
+            .pin => switch (c) {
+                'G', 'g' => .ping,
+                else => return Error.UnexpectedToken,
             },
-            .ping => {
-                switch (b) {
-                    '\n' => return OperationTag.ping, // found ping operation
-                    else => {},
-                }
+            .ping => switch (c) {
+                '\n' => return OperationTag.ping, // found ping operation
+                else => .ping,
             },
-            .po => {
-                switch (b) {
-                    'N', 'n' => state = .pon,
-                    else => return Error.UnexpectedToken,
-                }
+            .po => switch (c) {
+                'N', 'n' => .pon,
+                else => return Error.UnexpectedToken,
             },
-            .pon => {
-                switch (b) {
-                    'G', 'g' => state = .pong,
-                    else => return Error.UnexpectedToken,
-                }
+            .pon => switch (c) {
+                'G', 'g' => .pong,
+                else => return Error.UnexpectedToken,
             },
-            .pong => {
-                switch (b) {
-                    '\n' => return OperationTag.pong, // found pong operation
-                    else => {},
-                }
+            .pong => switch (c) {
+                '\n' => return OperationTag.pong, // found pong operation
+                else => .pong,
             },
-            .i => {
-                switch (b) {
-                    'N', 'n' => state = .in,
-                    else => return Error.UnexpectedToken,
-                }
+            .i => switch (c) {
+                'N', 'n' => .in,
+                else => return Error.UnexpectedToken,
             },
-            .in => {
-                switch (b) {
-                    'F', 'f' => state = .inf,
-                    else => return Error.UnexpectedToken,
-                }
+            .in => switch (c) {
+                'F', 'f' => .inf,
+                else => return Error.UnexpectedToken,
             },
-            .inf => {
-                switch (b) {
-                    'O', 'o' => state = .info,
-                    else => return Error.UnexpectedToken,
-                }
+            .inf => switch (c) {
+                'O', 'o' => .info,
+                else => return Error.UnexpectedToken,
             },
-            .info => {
-                switch (b) {
-                    ' ', '\t' => return OperationTag.info, // found info operation
-                    else => return Error.UnexpectedToken,
-                }
+            .info => switch (c) {
+                ' ', '\t' => return OperationTag.info, // found info operation
+                else => return Error.UnexpectedToken,
             },
-            .minus => {
-                switch (b) {
-                    'E', 'e' => state = .e,
-                    else => return Error.UnexpectedToken,
-                }
+            .minus => switch (c) {
+                'E', 'e' => .e,
+                else => return Error.UnexpectedToken,
             },
-            .e => {
-                switch (b) {
-                    'R', 'r' => state = .er,
-                    else => return Error.UnexpectedToken,
-                }
+            .e => switch (c) {
+                'R', 'r' => .er,
+                else => return Error.UnexpectedToken,
             },
-            .er => {
-                switch (b) {
-                    'R', 'r' => state = .err,
-                    else => return Error.UnexpectedToken,
-                }
+            .er => switch (c) {
+                'R', 'r' => .err,
+                else => return Error.UnexpectedToken,
             },
-            .err => {
-                switch (b) {
-                    ' ', '\t' => return OperationTag.err, // found err operation
-                    else => return Error.UnexpectedToken,
-                }
+            .err => switch (c) {
+                ' ', '\t' => return OperationTag.err, // found err operation
+                else => return Error.UnexpectedToken,
             },
-            .plus => {
-                switch (b) {
-                    'O', 'o' => state = .o,
-                    else => return Error.UnexpectedToken,
-                }
+            .plus => switch (c) {
+                'O', 'o' => .o,
+                else => return Error.UnexpectedToken,
             },
-            .o => {
-                switch (b) {
-                    'K', 'k' => state = .ok,
-                    else => return Error.UnexpectedToken,
-                }
+            .o => switch (c) {
+                'K', 'k' => .ok,
+                else => return Error.UnexpectedToken,
             },
-            .ok => {
-                switch (b) {
-                    '\n' => return OperationTag.ok,
-                    else => {},
-                }
+            .ok => switch (c) {
+                '\n' => return OperationTag.ok,
+                else => .ok,
             },
-            .m => {
-                switch (b) {
-                    'S', 's' => state = .ms,
-                    else => return Error.UnexpectedToken,
-                }
+            .h => switch (c) {
+                'M', 'm' => .m,
+                else => return Error.UnexpectedToken,
             },
-            .ms => {
-                switch (b) {
-                    'G', 'g' => state = .msg,
-                    else => return Error.UnexpectedToken,
-                }
+            .m => switch (c) {
+                'S', 's' => .ms,
+                else => return Error.UnexpectedToken,
             },
-            .msg => {
-                switch (b) {
-                    ' ', '\t' => return OperationTag.msg, // found msg operation
-                    else => return Error.UnexpectedToken,
-                }
+            .ms => switch (c) {
+                'G', 'g' => .msg,
+                else => return Error.UnexpectedToken,
             },
-        }
+            .msg => switch (c) {
+                ' ', '\t' => return if (hmsg) OperationTag.hmsg else OperationTag.msg, // found msg/hmsg operation
+                else => return Error.UnexpectedToken,
+            },
+        };
     }
     return Error.SplitBuffer;
 }
@@ -300,8 +273,7 @@ fn findArgsLine(self: *Self) !Loc {
     var drop: usize = 0;
 
     while (self.index < self.source.len) : (self.index += 1) {
-        const b = self.source[self.index];
-        switch (b) {
+        switch (self.source[self.index]) {
             ' ', '\t' => {
                 // drop whitespace at start
                 if (loc.start == self.index or loc.start == self.index - 1) {
@@ -330,11 +302,11 @@ fn readArgs(self: *Self) ![]const u8 {
 // from current location to the next whitespace (or end of line)
 fn findArg(self: *Self) !Loc {
     var loc = Loc{ .start = self.index };
+    var empty = true;
     while (self.index < self.source.len) : (self.index += 1) {
-        const b = self.source[self.index];
-        switch (b) {
+        switch (self.source[self.index]) {
             ' ', '\t' => {
-                if (loc.start == self.index or loc.start == self.index - 1) {
+                if (empty) {
                     loc.start = self.index + 1;
                     continue;
                 }
@@ -345,7 +317,9 @@ fn findArg(self: *Self) !Loc {
                 loc.end = self.index;
                 return loc;
             },
-            else => {},
+            else => {
+                empty = false;
+            },
         }
     }
     return Error.SplitBuffer;
@@ -369,17 +343,54 @@ fn msgArgs(self: *Self) !Msg {
         .subject = self.source[a1.start..a1.end],
         .sid = try std.fmt.parseUnsigned(u64, self.source[a2.start..a2.end], 10),
         .size = 0,
-        .reply = null,
+        .reply_to = null,
         .payload = null,
     };
     if (a4.empty()) {
         msg.size = try std.fmt.parseUnsigned(u64, self.source[a3.start..a3.end], 10);
     } else {
-        msg.reply = self.source[a3.start..a3.end];
+        msg.reply_to = self.source[a3.start..a3.end];
         msg.size = try std.fmt.parseUnsigned(u64, self.source[a4.start..a4.end], 10);
     }
     self.eatNewLine();
     return msg;
+}
+
+const Hmsg = struct {
+    msg: Msg,
+    header_size: usize,
+};
+
+fn hmsgArgs(self: *Self) !Hmsg {
+    const a1 = try self.findArg();
+    const a2 = try self.findArg();
+    const a3 = try self.findArg();
+    const a4 = try self.findArg();
+    const a5 = try self.findArg();
+    var msg = Msg{
+        .subject = self.source[a1.start..a1.end],
+        .sid = try std.fmt.parseUnsigned(u64, self.source[a2.start..a2.end], 10),
+        .size = 0,
+        .reply_to = null,
+        .payload = null,
+    };
+    var header_size: usize = 0;
+    if (a5.empty()) {
+        header_size = try std.fmt.parseUnsigned(u64, self.source[a3.start..a3.end], 10);
+        msg.size = try std.fmt.parseUnsigned(u64, self.source[a4.start..a4.end], 10);
+    } else {
+        msg.reply_to = self.source[a3.start..a3.end];
+        header_size = try std.fmt.parseUnsigned(u64, self.source[a4.start..a4.end], 10);
+        msg.size = try std.fmt.parseUnsigned(u64, self.source[a5.start..a5.end], 10);
+    }
+    if (msg.size < header_size) {
+        return Error.BadHeaderSize;
+    }
+    self.eatNewLine();
+    return Hmsg{
+        .msg = msg,
+        .header_size = header_size,
+    };
 }
 
 // testing imports
@@ -518,7 +529,7 @@ test "MSG with reply" {
     try expectEqual(op.msg.sid, 10);
     try expectEqual(op.msg.size, 12);
     try expectEqual(op.msg.payload.?.len, 12);
-    try expectEqualStrings("INBOX.34", op.msg.reply.?);
+    try expectEqualStrings("INBOX.34", op.msg.reply_to.?);
     try expectEqualStrings("012345678901", op.msg.payload.?);
     try expectEqual(parser.parsed_index, buf.len);
     try expectEqual(buf[parser.parsed_index..].len, 0);
@@ -549,4 +560,26 @@ test "split buffer" {
         try expectEqualStrings(c.unparsed, parser.unparsed());
         try expectEqual(c.ops, parser.operations);
     }
+}
+
+test "HMSG operation" {
+    var parser = init("HMSG foo 123 3 8\r\nXXXhello\r");
+    var op = try parser.next();
+    try expect(op == .hmsg);
+    try expectEqualStrings("foo", op.hmsg.subject);
+    try expectEqual(op.hmsg.sid, 123);
+    try expect(op.hmsg.payload.?.len == 5);
+    try expect(op.hmsg.header.?.len == 3);
+    try expectEqualStrings("hello", op.hmsg.payload.?);
+    try expectEqualStrings("XXX", op.hmsg.header.?);
+
+    parser = init("HMSG foo.bar 123 INBOX.22 3 14\r\nOK:hello world\r");
+    op = try parser.next();
+    try expect(op == .hmsg);
+    try expect(op.hmsg.payload.?.len == 11);
+    try expect(op.hmsg.header.?.len == 3);
+    try expectEqualStrings("hello world", op.hmsg.payload.?);
+    try expectEqualStrings("OK:", op.hmsg.header.?);
+    try expectEqualStrings("foo.bar", op.hmsg.subject);
+    try expectEqual(op.hmsg.sid, 123);
 }
