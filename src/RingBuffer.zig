@@ -8,7 +8,7 @@ const Thread = std.Thread;
 //
 // Uses conditon variables. Note to myself: cw.wait unlocks waits for signal and
 // then locks provided mutex.
-pub fn RingBuffer(comptime T: type, buffer_size: usize) type {
+pub fn RingBuffer(comptime T: type, comptime buffer_size: usize) type {
     return struct {
         buffer: [buffer_size]T = undefined,
         mut: Thread.Mutex = Thread.Mutex{},

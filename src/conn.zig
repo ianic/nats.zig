@@ -1,4 +1,4 @@
-const std = @import("std");
+fconst std = @import("std");
 const assert = std.debug.assert;
 const net = std.x.net;
 const fmt = std.fmt;
@@ -42,7 +42,7 @@ pub const ConnectOptions = struct {
 };
 
 pub fn connect(opt: ConnectOptions) !*Conn {
-    try ignoreSigPipe();
+    //try ignoreSigPipe();
     return try Conn.connect(opt);
 }
 
@@ -556,7 +556,7 @@ const Writer = struct {
     buffer: []u8,
     bb: BipBuffer,
     trd: Thread = undefined,
-    kicker: std.Thread.AutoResetEvent,
+    kicker: std.Thread.ResetEvent,
     done: bool = false,
     sent: usize = 0,
     net_cli: ?*net.tcp.Client = null,
@@ -574,7 +574,7 @@ const Writer = struct {
             .alloc = alloc,
             .buffer = buffer,
             .bb = BipBuffer.init(buffer),
-            .kicker = std.Thread.AutoResetEvent{},
+            .kicker = std.Thread.ResetEvent{},
         };
         writer.trd = try Thread.spawn(.{}, Self.flushLoop, .{writer});
         return writer;
@@ -675,7 +675,7 @@ const Writer = struct {
         log.info("resize write buffer {} => {}", .{ self.buffer.len, n_len });
         var buffer = try self.alloc.alloc(u8, n_len);
         var n_bb = BipBuffer.init(buffer);
-        n_bb.copy(self.bb);
+        n_bb.copy(&self.bb);
         self.bb = n_bb;
         self.alloc.free(self.buffer);
         self.buffer = buffer;
