@@ -85,7 +85,15 @@ pub fn reInit(self: *Self, source: []const u8) void {
     self.parsed_index = 0;
 }
 
-pub fn next(self: *Self) !Operation {
+pub fn next(self: *Self) !?Operation {
+    if (self.index == self.source.len) {
+        return null;
+    }
+    const op = try self.read();
+    return op;
+}
+
+fn read(self: *Self) !Operation {
     const start_index = self.index;
     const tag = try self.readOperation();
     self.index += 1; // we are now on the whitespace, move forward
@@ -423,7 +431,7 @@ test "PING operation" {
     };
     for (pings) |buf| {
         var parser = init(buf);
-        const op = try parser.next();
+        const op = try parser.read();
         try expect(op == .ping);
         try expect(op == OperationTag.ping);
         try expect(@as(OperationTag, op) == OperationTag.ping);
@@ -440,7 +448,7 @@ test "PONG operation" {
     };
     for (pongs) |buf| {
         var parser = init(buf);
-        const op = try parser.next();
+        const op = try parser.read();
         try expect(op == .pong);
         try expect(parser.unparsed().len == 0);
     }
@@ -454,7 +462,7 @@ test "ERR operation" {
     };
     for (errs) |buf, i| {
         var parser = init(buf);
-        const op = try parser.next();
+        const op = try parser.read();
         try expect(op == .err);
         switch (i) {
             0 => try expectEqualStrings("'Stale Connection'", op.err.args),
@@ -476,7 +484,7 @@ test "INFO operation" {
     var printBuf: [16]u8 = undefined;
     for (valid) |buf, i| {
         var parser = init(buf);
-        const op = try parser.next();
+        const op = try parser.read();
         try expect(op == .info);
         try expect(parser.unparsed().len == 0);
         try expectEqualStrings(
@@ -496,7 +504,7 @@ test "UnexpectedToken error" {
     };
     for (unexpected_token) |buf| {
         var parser = init(buf);
-        var err = parser.next();
+        var err = parser.read();
         try expectError(Error.UnexpectedToken, err);
     }
 }
@@ -508,7 +516,7 @@ test "MSG operation" {
     };
     for (valid) |buf| {
         var parser = init(buf);
-        const op = try parser.next();
+        const op = try parser.read();
         try expect(op == .msg);
         try expectEqualStrings("subject", op.msg.subject);
         try expectEqual(op.msg.sid, 123);
@@ -522,12 +530,12 @@ test "MSG operation" {
 test "MSG without payload" {
     const buf = "MSG subject 123 0\nPING\n";
     var parser = init(buf);
-    const op = try parser.next();
+    const op = try parser.read();
     try expect(op == .msg);
     try expectEqualStrings("subject", op.msg.subject);
     try expectEqual(op.msg.sid, 123);
     try expectEqual(op.msg.payload, null);
-    const op2 = try parser.next();
+    const op2 = try parser.read();
     try expect(op2 == .ping);
     try expect(parser.unparsed().len == 0);
 }
@@ -535,7 +543,7 @@ test "MSG without payload" {
 test "MSG with reply" {
     const buf = "msg bar.foo 10 INBOX.34 12\n012345678901\n";
     var parser = init(buf);
-    const op = try parser.next();
+    const op = try parser.read();
     try expect(op == .msg);
     try expectEqualStrings("bar.foo", op.msg.subject);
     try expectEqual(op.msg.sid, 10);
@@ -566,9 +574,9 @@ test "split buffer" {
         var parser = init(c.buf);
         var i: usize = 0;
         while (i < c.ops) : (i += 1) {
-            _ = try parser.next();
+            _ = try parser.read();
         }
-        const err = parser.next();
+        const err = parser.read();
         try expectError(Error.SplitBuffer, err);
         try expectEqual(c.parsed_index, parser.parsed_index);
         try expectEqualStrings("MSG", c.buf[parser.parsed_index .. parser.parsed_index + 3]);
@@ -579,7 +587,7 @@ test "split buffer" {
 
 test "HMSG operation" {
     var parser = init("HMSG foo 123 3 8\r\nXXXhello\r");
-    var op = try parser.next();
+    var op = try parser.read();
     try expect(op == .hmsg);
     try expectEqualStrings("foo", op.hmsg.subject);
     try expectEqual(op.hmsg.sid, 123);
@@ -589,7 +597,7 @@ test "HMSG operation" {
     try expectEqualStrings("XXX", op.hmsg.header.?);
 
     parser = init("HMSG foo.bar 123 INBOX.22 3 14\r\nOK:hello world\r");
-    op = try parser.next();
+    op = try parser.read();
     try expect(op == .hmsg);
     try expect(op.hmsg.payload.?.len == 11);
     try expect(op.hmsg.header.?.len == 3);

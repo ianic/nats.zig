@@ -6,26 +6,56 @@ const Parser = @import("../src/NonAllocatingParser.zig");
 // TODO move this to parser (small letter)
 const Operation = Parser.Operation;
 const Msg = Parser.Msg;
+const Allocator = std.mem.Allocator;
 
-// constants
-const max_args_len = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
-const connect_op = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
-const pong_op = "PONG\r\n";
-const ping_op = "PING\r\n";
+const default = struct {
+    const ip = "127.0.0.1";
+    const port = 4222;
 
-pub fn connect() !Conn {
-    return try Conn.connect();
+    const read_buffer_size = 4096;
+    const max_control_line_size = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
+
+    const connect = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
+    const pong = "PONG\r\n";
+    const ping = "PING\r\n";
+};
+
+const Error = error{
+    HandshakeFailed,
+    ServerError,
+    EOF, // when no bytes are received on socket
+    NotOpenForReading, // when socket is closed
+    RequestTimeout,
+    MaxPayloadExceeded,
+    ConnectionResetByPeer,
+    ClientNotConnected,
+    WriteBufferExceeded,
+    Disconnected,
+};
+
+pub fn connect(allocator: Allocator) !Conn {
+    return try Conn.connect(allocator);
 }
 
 const Conn = struct {
     const Self = @This();
 
+    allocator: Allocator,
     net_cli: tcp.Client,
-    scratch_buf: [max_args_len]u8 = undefined,
+    scratch_buf: [default.max_control_line_size]u8 = undefined,
+    read_buf: []u8,
+    sid: u64 = 0,
+    parser: Parser,
 
-    pub fn connect() !Self {
+    pub fn connect(allocator: Allocator) !Self {
+        const read_buf = try allocator.alloc(u8, default.read_buffer_size);
+        errdefer allocator.free(read_buf);
+
         var conn = Self{
+            .allocator = allocator,
             .net_cli = try tcpConnect(),
+            .read_buf = read_buf,
+            .parser = Parser.init(read_buf[0..0]),
         };
         try conn.connectHandshake();
         return conn;
@@ -33,37 +63,47 @@ const Conn = struct {
 
     pub fn close(self: *Self) void {
         self.net_cli.shutdown(.both) catch {};
+        self.allocator.free(self.read_buf);
     }
 
     pub fn read(self: *Self) !?Msg {
         while (true) {
-            try self.net_cli.setReadTimeout(3000);
-            var op = self.readOp() catch |err| {
+            while (try self.parser.next()) |op| {
+                switch (op) {
+                    .msg => return op.msg,
+                    .hmsg => return op.hmsg,
+                    .ping => {
+                        _ = try self.netWrite(default.pong);
+                    },
+                    .info => {
+                        // TODO use info message
+                    },
+                    .pong => {},
+                    .ok => {},
+                    .err => {
+                        return Error.ServerError;
+                    },
+                }
+            }
+
+            try self.net_cli.setReadTimeout(1000);
+            const offset = self.net_cli.read(self.read_buf, 0) catch |err| {
                 if (err == error.WouldBlock) {
                     return null;
                 }
                 return err;
             };
-            switch (op) {
-                .msg => return op.msg,
-                .hmsg => return op.hmsg,
-                .ping => {
-                    _ = try self.netWrite(pong_op);
-                },
-                .info => {
-                    // TODO use info message
-                },
-                .pong => {},
-                .ok => {},
-                .err => {
-                    return Error.ServerError;
-                },
+            if (offset == 0) {
+                return null;
             }
+            const buf = self.read_buf[0..offset];
+            debugConnIn(buf);
+            self.parser.reInit(buf);
         }
     }
 
     fn tcpConnect() !tcp.Client {
-        const addr = net.ip.Address.initIPv4(try std.x.os.IPv4.parse("127.0.0.1"), 4222);
+        const addr = net.ip.Address.initIPv4(try std.x.os.IPv4.parse(default.ip), default.port);
         const client = try tcp.Client.init(.ip, .{ .close_on_exec = true });
         try client.connect(addr);
         errdefer client.deinit();
@@ -79,8 +119,8 @@ const Conn = struct {
         //self.onInfo(op.info);
 
         // send CONNECT, PING
-        _ = try self.netWrite(connect_op);
-        _ = try self.netWrite(ping_op);
+        _ = try self.netWrite(default.connect);
+        _ = try self.netWrite(default.ping);
 
         // expect PONG
         if (try self.readOp() != .pong) {
@@ -92,7 +132,10 @@ const Conn = struct {
         const offset = try self.net_cli.read(&self.scratch_buf, 0);
         debugConnIn(self.scratch_buf[0..offset]);
         var parser = Parser.init(self.scratch_buf[0..offset]);
-        return parser.next();
+
+        // TODO
+        const op = try parser.next();
+        return op.?;
     }
 
     fn netRead(self: *Self, buf: []u8) !usize {
@@ -109,6 +152,18 @@ const Conn = struct {
 
     fn netClose(self: *Self) void {
         _ = self;
+    }
+
+    pub fn subscribe(self: *Self, subject: []const u8) !u64 {
+        self.sid += 1;
+        try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "SUB {s} {d}\r\n", .{ subject, self.sid }));
+        return self.sid;
+    }
+
+    pub fn publish(self: *Self, subject: []const u8, payload: []const u8) !void {
+        try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "PUB {s} {d}\r\n", .{ subject, payload.len }));
+        try self.netWrite(payload);
+        try self.netWrite("\r\n");
     }
 };
 
@@ -130,16 +185,3 @@ fn logProtocolOp(prefix: []const u8, buf: []const u8) void {
     }
     log.debug("{s} {s}", .{ prefix, b });
 }
-
-const Error = error{
-    HandshakeFailed,
-    ServerError,
-    EOF, // when no bytes are received on socket
-    NotOpenForReading, // when socket is closed
-    RequestTimeout,
-    MaxPayloadExceeded,
-    ConnectionResetByPeer,
-    ClientNotConnected,
-    WriteBufferExceeded,
-    Disconnected,
-};

@@ -25,7 +25,9 @@ pub fn build(b: *std.build.Builder) void {
         "pub",
         "sub",
         "test",
-        "connect",
+        //        "connect",
+        "sync_pub",
+        "sync_sub",
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
         example.addPackagePath("nats", "./src/conn.zig");

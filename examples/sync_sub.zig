@@ -1,6 +1,7 @@
 const std = @import("std");
 const nats = @import("nats-sync");
 const log = std.log.scoped(.app);
+pub const log_level: std.log.Level = .info;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -13,7 +14,9 @@ pub fn main() !void {
     const sid = try conn.subscribe("foo");
     log.debug("subscribe sid: {d}", .{sid});
 
-    if (try conn.read()) |msg| {
-        log.debug("got msg {}", .{msg});
+    while (true) {
+        if (try conn.read()) |msg| {
+            log.info("got msg {s}", .{msg.payload.?});
+        }
     }
 }
