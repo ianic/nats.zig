@@ -10,6 +10,10 @@ pub fn build(b: *std.build.Builder) void {
     lib.setBuildMode(mode);
     lib.install();
 
+    const sync_lib = b.addStaticLibrary("nats-sync", "./src/sync.zig");
+    sync_lib.setBuildMode(mode);
+    sync_lib.install();
+
     var main_tests = b.addTest("conn.zig");
     main_tests.setBuildMode(mode);
 
@@ -21,9 +25,11 @@ pub fn build(b: *std.build.Builder) void {
         "pub",
         "sub",
         "test",
+        "connect",
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
         example.addPackagePath("nats", "./src/conn.zig");
+        example.addPackagePath("nats-sync", "./src/sync.zig");
         example.setBuildMode(mode);
         example.setTarget(target);
         example.install();
