@@ -410,12 +410,10 @@ fn hmsgArgs(self: *Self) !MsgArgs {
 }
 
 // testing imports
-const testing = std.testing;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const expectError = std.testing.expectError;
-const mem = std.mem;
 
 test "PING operation" {
     const pings = [_][]const u8{
@@ -459,9 +457,9 @@ test "ERR operation" {
         const op = try parser.next();
         try expect(op == .err);
         switch (i) {
-            0 => try expect(mem.eql(u8, "'Stale Connection'", op.err.args)),
-            1 => try expect(mem.eql(u8, "'Unknown Protocol Operation'", op.err.args)),
-            2 => try expect(mem.eql(u8, "'Permissions Violation for Subscription to foo.bar'\t", op.err.args)),
+            0 => try expectEqualStrings("'Stale Connection'", op.err.args),
+            1 => try expectEqualStrings("'Unknown Protocol Operation'", op.err.args),
+            2 => try expectEqualStrings("'Permissions Violation for Subscription to foo.bar'\t", op.err.args),
             else => {},
         }
         try expect(parser.unparsed().len == 0);
