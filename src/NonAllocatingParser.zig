@@ -13,7 +13,6 @@ const Self = @This();
 
 pub const Error = error{
     SplitBuffer,
-    //BufferOverflow,
     UnexpectedToken,
     BadHeaderSize,
 };

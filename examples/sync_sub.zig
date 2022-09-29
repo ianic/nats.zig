@@ -11,7 +11,10 @@ pub fn main() !void {
     var conn = try nats.connect(allocator);
     defer conn.close();
 
-    const sid = try conn.subscribe("foo");
+    var sid = try conn.subscribe("foo");
+    log.debug("subscribe sid: {d}", .{sid});
+    try conn.unsubscribe(sid);
+    sid = try conn.subscribe("foo");
     log.debug("subscribe sid: {d}", .{sid});
 
     while (true) {

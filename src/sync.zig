@@ -3,7 +3,6 @@ const net = std.x.net;
 const tcp = net.tcp;
 const log = std.log.scoped(.nats);
 const Parser = @import("../src/NonAllocatingParser.zig");
-// TODO move this to parser (small letter)
 const Operation = Parser.Operation;
 const Msg = Parser.Msg;
 const Info = Parser.Info;
@@ -26,14 +25,6 @@ const default = struct {
 const Error = error{
     HandshakeFailed,
     ServerError,
-    EOF, // when no bytes are received on socket
-    NotOpenForReading, // when socket is closed
-    RequestTimeout,
-    MaxPayloadExceeded,
-    ConnectionResetByPeer,
-    ClientNotConnected,
-    WriteBufferExceeded,
-    Disconnected,
 };
 
 pub fn connect(allocator: Allocator) !Conn {
@@ -74,50 +65,34 @@ const Conn = struct {
             if (try self.parseReadBuffer()) |msg| {
                 return msg;
             }
-            const unparsed = self.parser.unparsedBytes();
-            try self.net_cli.setReadTimeout(default.read_timeout);
-            const offset = self.net_cli.read(self.read_buf[unparsed..], 0) catch |err| {
-                if (err == error.WouldBlock) {
-                    return null;
-                }
-                return err;
-            };
-            if (offset == 0) {
-                return null;
+            if (try self.netRead()) |buf| {
+                self.parser.reInit(buf);
+                continue;
             }
-            const buf = self.read_buf[0 .. offset + unparsed];
-            debugConnIn(buf);
-            self.parser.reInit(buf);
+            return null;
         }
+    }
+
+    fn netRead(self: *Self) !?[]const u8 {
+        const unparsed = self.parser.unparsedBytes();
+        try self.net_cli.setReadTimeout(default.read_timeout);
+        const offset = self.net_cli.read(self.read_buf[unparsed..], 0) catch |err| {
+            if (err == error.WouldBlock) {
+                return null; // read timeout expired
+            }
+            return err;
+        };
+        if (offset == 0) { // this probably cant happen
+            return null;
+        }
+        const buf = self.read_buf[0 .. offset + unparsed];
+        debugConnIn(buf);
+        return buf;
     }
 
     fn parseReadBuffer(self: *Self) !?Msg {
         while (true) {
-            const opt_op = self.parser.next() catch |err| {
-                switch (err) {
-                    Parser.Error.SplitBuffer => {
-                        try self.onParserSplitBuffer();
-                        // const unparsed = self.parser.unparsed();
-                        // std.mem.copy(u8, self.read_buf, unparsed);
-                        // log.info("split buffer, copying {d} unparsed bytes", .{unparsed.len});
-                        return null;
-                    },
-                    // Parser.Error.BufferOverflow => {
-                    //     const read_buf = try self.allocator.alloc(u8, self.read_buf.len * 2);
-                    //     const unparsed = self.parser.unparsed();
-                    //     std.mem.copy(u8, read_buf, unparsed);
-                    //     self.allocator.free(self.read_buf);
-                    //     self.read_buf = read_buf;
-                    //     log.info(
-                    //         "read buffer overflow, extending buffer to {d}, copying {d} unparsed bytes",
-                    //         .{ self.read_buf.len, unparsed.len },
-                    //     );
-                    //     return null;
-                    // },
-                    else => return err,
-                }
-            };
-            if (opt_op) |op| {
+            if (try self.parseOperation()) |op| {
                 switch (op) {
                     .msg => return op.msg,
                     .hmsg => return op.hmsg,
@@ -134,6 +109,18 @@ const Conn = struct {
             }
             return null;
         }
+    }
+
+    fn parseOperation(self: *Self) !?Operation {
+        return self.parser.next() catch |err| {
+            switch (err) {
+                Parser.Error.SplitBuffer => {
+                    try self.onParserSplitBuffer();
+                    return null;
+                },
+                else => return err,
+            }
+        };
     }
 
     fn onParserSplitBuffer(self: *Self) !void {
@@ -202,13 +189,6 @@ const Conn = struct {
         return op.?;
     }
 
-    fn netRead(self: *Self, buf: []u8) !usize {
-        if (self.net_cli) |c| {
-            return try c.read(buf, 0);
-        }
-        return Error.ClientNotConnected;
-    }
-
     fn netWrite(self: *Self, buf: []const u8) !void {
         _ = try self.net_cli.write(buf, 0);
         debugConnOut(buf);
@@ -222,6 +202,10 @@ const Conn = struct {
         self.sid += 1;
         try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "SUB {s} {d}\r\n", .{ subject, self.sid }));
         return self.sid;
+    }
+
+    pub fn unsubscribe(self: *Self, sid: u64) !void {
+        try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "UNSUB {d}\r\n", .{sid}));
     }
 
     pub fn publish(self: *Self, subject: []const u8, payload: []const u8) !void {
