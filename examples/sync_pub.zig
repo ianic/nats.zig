@@ -11,12 +11,17 @@ pub fn main() !void {
     var conn = try nats.connect(allocator);
     defer conn.close();
 
-    var i: usize = 0;
-    var scratch: [128]u8 = undefined;
+    var scratch: [1024]u8 = undefined;
 
-    while (i < 10) : (i += 1) {
-        const payload = try std.fmt.bufPrint(&scratch, "msg {d}", .{i});
-        try conn.publish("foo", payload);
-        log.info("{s}", .{payload});
+    for (scratch) |_, j| {
+        scratch[j] = @intCast(u8, (j % 10)) + 48;
+    }
+
+    var i: usize = 1;
+    while (i < 1024) : (i += 1) {
+        //const payload = try std.fmt.bufPrint(&scratch, "msg {d}", .{i});
+        const buf = scratch[0..i];
+        try conn.publish("foo", buf);
+        log.info("{d}", .{buf.len});
     }
 }

@@ -6,14 +6,17 @@ const Parser = @import("../src/NonAllocatingParser.zig");
 // TODO move this to parser (small letter)
 const Operation = Parser.Operation;
 const Msg = Parser.Msg;
+const Info = Parser.Info;
+const Err = Parser.Err;
 const Allocator = std.mem.Allocator;
 
 const default = struct {
     const ip = "127.0.0.1";
     const port = 4222;
 
-    const read_buffer_size = 4096;
+    const read_buffer_size = 16;
     const max_control_line_size = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
+    const read_timeout = 1000; // milliseconds
 
     const connect = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
     const pong = "PONG\r\n";
@@ -68,26 +71,12 @@ const Conn = struct {
 
     pub fn read(self: *Self) !?Msg {
         while (true) {
-            while (try self.parser.next()) |op| {
-                switch (op) {
-                    .msg => return op.msg,
-                    .hmsg => return op.hmsg,
-                    .ping => {
-                        _ = try self.netWrite(default.pong);
-                    },
-                    .info => {
-                        // TODO use info message
-                    },
-                    .pong => {},
-                    .ok => {},
-                    .err => {
-                        return Error.ServerError;
-                    },
-                }
+            if (try self.parseReadBuffer()) |msg| {
+                return msg;
             }
-
-            try self.net_cli.setReadTimeout(1000);
-            const offset = self.net_cli.read(self.read_buf, 0) catch |err| {
+            const unparsed = self.parser.unparsedBytes();
+            try self.net_cli.setReadTimeout(default.read_timeout);
+            const offset = self.net_cli.read(self.read_buf[unparsed..], 0) catch |err| {
                 if (err == error.WouldBlock) {
                     return null;
                 }
@@ -96,10 +85,79 @@ const Conn = struct {
             if (offset == 0) {
                 return null;
             }
-            const buf = self.read_buf[0..offset];
+            const buf = self.read_buf[0 .. offset + unparsed];
             debugConnIn(buf);
             self.parser.reInit(buf);
         }
+    }
+
+    fn parseReadBuffer(self: *Self) !?Msg {
+        while (true) {
+            const opt_op = self.parser.next() catch |err| {
+                switch (err) {
+                    Parser.Error.SplitBuffer => {
+                        try self.onParserSplitBuffer();
+                        // const unparsed = self.parser.unparsed();
+                        // std.mem.copy(u8, self.read_buf, unparsed);
+                        // log.info("split buffer, copying {d} unparsed bytes", .{unparsed.len});
+                        return null;
+                    },
+                    // Parser.Error.BufferOverflow => {
+                    //     const read_buf = try self.allocator.alloc(u8, self.read_buf.len * 2);
+                    //     const unparsed = self.parser.unparsed();
+                    //     std.mem.copy(u8, read_buf, unparsed);
+                    //     self.allocator.free(self.read_buf);
+                    //     self.read_buf = read_buf;
+                    //     log.info(
+                    //         "read buffer overflow, extending buffer to {d}, copying {d} unparsed bytes",
+                    //         .{ self.read_buf.len, unparsed.len },
+                    //     );
+                    //     return null;
+                    // },
+                    else => return err,
+                }
+            };
+            if (opt_op) |op| {
+                switch (op) {
+                    .msg => return op.msg,
+                    .hmsg => return op.hmsg,
+                    .ping => try self.sendPong(),
+                    .info => self.onInfo(op.info),
+                    .pong => {},
+                    .ok => {},
+                    .err => {
+                        log.err("error: {s}", .{op.err.args});
+                        return Error.ServerError;
+                    },
+                }
+                continue;
+            }
+            return null;
+        }
+    }
+
+    fn onParserSplitBuffer(self: *Self) !void {
+        const extend = self.parser.parsed_index < self.parser.source.len / 2 or
+            self.parser.stat.batch_operations < 4;
+
+        const unparsed = self.parser.unparsed();
+        if (extend) {
+            const old_read_buf = self.read_buf;
+            self.read_buf = try self.allocator.alloc(u8, self.read_buf.len * 2);
+            std.mem.copy(u8, self.read_buf, unparsed);
+            self.allocator.free(old_read_buf);
+            log.debug(
+                "read buffer overflow, extending buffer to {d}, copying {d} unparsed bytes",
+                .{ self.read_buf.len, unparsed.len },
+            );
+        } else {
+            std.mem.copy(u8, self.read_buf, unparsed);
+            log.debug("split buffer, copying {d} unparsed bytes", .{unparsed.len});
+        }
+    }
+
+    fn sendPong(self: *Self) !void {
+        _ = try self.netWrite(default.pong);
     }
 
     fn tcpConnect() !tcp.Client {
@@ -112,11 +170,11 @@ const Conn = struct {
 
     fn connectHandshake(self: *Self) !void {
         // expect INFO at start
-        if (try self.readOp() != .info) {
+        const op = try self.readOp();
+        if (op != .info) {
             return Error.HandshakeFailed;
         }
-        //  TODO use info message
-        //self.onInfo(op.info);
+        self.onInfo(op.info);
 
         // send CONNECT, PING
         _ = try self.netWrite(default.connect);
@@ -126,6 +184,12 @@ const Conn = struct {
         if (try self.readOp() != .pong) {
             return Error.HandshakeFailed;
         }
+    }
+
+    fn onInfo(self: *Self, info: Info) void {
+        // TODO
+        _ = info;
+        _ = self;
     }
 
     fn readOp(self: *Self) !Operation {
@@ -168,11 +232,11 @@ const Conn = struct {
 };
 
 fn debugConnIn(buf: []const u8) void {
-    logProtocolOp(">", buf);
+    logProtocolOp(">>", buf);
 }
 
 fn debugConnOut(buf: []const u8) void {
-    logProtocolOp("<", buf);
+    logProtocolOp("<<", buf);
 }
 
 fn logProtocolOp(prefix: []const u8, buf: []const u8) void {
@@ -183,5 +247,15 @@ fn logProtocolOp(prefix: []const u8, buf: []const u8) void {
     if (buf[buf.len - 1] == '\n') {
         b = buf[0 .. buf.len - 1];
     }
-    log.debug("{s} {s}", .{ prefix, b });
+    if (b.len > 0 and b[b.len - 1] == '\r') {
+        b = b[0 .. b.len - 1];
+    }
+    if (b.len > 0 and b[0] == '\r') {
+        b = b[1..];
+    }
+    if (b.len > 128) {
+        log.debug("{s} {s}...+{d} bytes", .{ prefix, b[0..128], buf.len - 128 });
+    } else {
+        log.debug("{s} {s}", .{ prefix, b });
+    }
 }

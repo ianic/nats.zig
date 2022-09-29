@@ -13,6 +13,7 @@ const Self = @This();
 
 pub const Error = error{
     SplitBuffer,
+    //BufferOverflow,
     UnexpectedToken,
     BadHeaderSize,
 };
@@ -71,6 +72,7 @@ stat: struct {
     operations: usize = 0, // number of parsed operations
     bytes: usize = 0, // parsed bytes so far
     msgs: usize = 0, // number of parsed mesages
+    batch_operations: usize = 0, // number of parsed operations in this batch, since last reInit
 } = .{},
 
 pub fn init(source: []const u8) Self {
@@ -83,14 +85,14 @@ pub fn reInit(self: *Self, source: []const u8) void {
     self.source = source;
     self.index = 0;
     self.parsed_index = 0;
+    self.stat.batch_operations = 0;
 }
 
 pub fn next(self: *Self) !?Operation {
     if (self.index == self.source.len) {
         return null;
     }
-    const op = try self.read();
-    return op;
+    return try self.read();
 }
 
 fn read(self: *Self) !Operation {
@@ -111,6 +113,7 @@ fn read(self: *Self) !Operation {
     self.parsed_index = self.index;
 
     self.stat.operations += 1;
+    self.stat.batch_operations += 1;
     self.stat.bytes += self.index - start_index;
     if (op == .msg or op == .hmsg) {
         self.stat.msgs += 1;
@@ -120,6 +123,10 @@ fn read(self: *Self) !Operation {
 
 pub fn unparsed(self: *Self) []const u8 {
     return self.source[self.parsed_index..];
+}
+
+pub fn unparsedBytes(self: *Self) usize {
+    return self.source.len - self.parsed_index;
 }
 
 fn readMsg(self: *Self) !Operation {
