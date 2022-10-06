@@ -8,7 +8,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var conn = try nats.connect(allocator);
+    var conn = try nats.connect(allocator, .{});
     defer conn.close();
 
     var scratch: [1024]u8 = undefined;

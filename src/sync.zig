@@ -9,17 +9,25 @@ const Info = Parser.Info;
 const Err = Parser.Err;
 const Allocator = std.mem.Allocator;
 
-const default = struct {
-    const ip = "127.0.0.1";
-    const port = 4222;
-
-    const read_buffer_size = 16;
-    const max_control_line_size = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
-    const read_timeout = 1000; // milliseconds
-
+const operation = struct {
     const connect = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
     const pong = "PONG\r\n";
     const ping = "PING\r\n";
+};
+
+const default = struct {
+    const max_control_line_size = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
+};
+
+const Options = struct {
+    ip: []const u8 = "127.0.0.1",
+    port: u16 = 4222,
+
+    read_buffer_size: u32 = 4096,
+    read_timeout: u32 = 1000, // milliseconds
+
+    max_reconnect: u8 = 60,
+    reconnect_wait: usize = std.time.ns_per_s * 2,
 };
 
 const Error = error{
@@ -27,8 +35,8 @@ const Error = error{
     ServerError,
 };
 
-pub fn connect(allocator: Allocator) !Conn {
-    return try Conn.connect(allocator);
+pub fn connect(allocator: Allocator, options: Options) !Conn {
+    return try Conn.connect(allocator, options);
 }
 
 const Conn = struct {
@@ -40,17 +48,20 @@ const Conn = struct {
     read_buf: []u8,
     sid: u64 = 0,
     parser: Parser,
+    options: Options,
 
-    pub fn connect(allocator: Allocator) !Self {
-        const read_buf = try allocator.alloc(u8, default.read_buffer_size);
+    pub fn connect(allocator: Allocator, options: Options) !Self {
+        const read_buf = try allocator.alloc(u8, options.read_buffer_size);
         errdefer allocator.free(read_buf);
 
         var conn = Self{
             .allocator = allocator,
-            .net_cli = try tcpConnect(),
+            .net_cli = try tcpConnect(options.ip, options.port),
             .read_buf = read_buf,
             .parser = Parser.init(read_buf[0..0]),
+            .options = options,
         };
+        try conn.initNetCli();
         try conn.connectHandshake();
         return conn;
     }
@@ -75,15 +86,14 @@ const Conn = struct {
 
     fn netRead(self: *Self) !?[]const u8 {
         const unparsed = self.parser.unparsedBytes();
-        try self.net_cli.setReadTimeout(default.read_timeout);
         const offset = self.net_cli.read(self.read_buf[unparsed..], 0) catch |err| {
             if (err == error.WouldBlock) {
                 return null; // read timeout expired
             }
             return err;
         };
-        if (offset == 0) { // this probably cant happen
-            return null;
+        if (offset == 0) {
+            try self.reConnect();
         }
         const buf = self.read_buf[0 .. offset + unparsed];
         debugConnIn(buf);
@@ -144,11 +154,35 @@ const Conn = struct {
     }
 
     fn sendPong(self: *Self) !void {
-        _ = try self.netWrite(default.pong);
+        _ = try self.netWrite(operation.pong);
     }
 
-    fn tcpConnect() !tcp.Client {
-        const addr = net.ip.Address.initIPv4(try std.x.os.IPv4.parse(default.ip), default.port);
+    fn reConnect(self: *Self) !void {
+        self.net_cli.shutdown(.both) catch {};
+        self.net_cli.deinit();
+        var cnt: usize = 0;
+        while (true) {
+            log.debug("reconnecting {d} of {d}", .{ cnt, self.options.max_reconnect });
+            var client = tcpConnect(self.options.ip, self.options.port) catch |err| {
+                if (cnt < self.options.max_reconnect) {
+                    std.time.sleep(self.options.reconnect_wait);
+                    cnt += 1;
+                    continue;
+                }
+                return err;
+            };
+            self.net_cli = client;
+            try self.initNetCli();
+            break;
+        }
+    }
+
+    fn initNetCli(self: *Self) !void {
+        try self.net_cli.setReadTimeout(self.options.read_timeout);
+    }
+
+    fn tcpConnect(ip: []const u8, port: u16) !tcp.Client {
+        const addr = net.ip.Address.initIPv4(try std.x.os.IPv4.parse(ip), port);
         const client = try tcp.Client.init(.ip, .{ .close_on_exec = true });
         try client.connect(addr);
         errdefer client.deinit();
@@ -164,8 +198,8 @@ const Conn = struct {
         self.onInfo(op.info);
 
         // send CONNECT, PING
-        _ = try self.netWrite(default.connect);
-        _ = try self.netWrite(default.ping);
+        _ = try self.netWrite(operation.connect);
+        _ = try self.netWrite(operation.ping);
 
         // expect PONG
         if (try self.readOp() != .pong) {
@@ -192,10 +226,6 @@ const Conn = struct {
     fn netWrite(self: *Self, buf: []const u8) !void {
         _ = try self.net_cli.write(buf, 0);
         debugConnOut(buf);
-    }
-
-    fn netClose(self: *Self) void {
-        _ = self;
     }
 
     pub fn subscribe(self: *Self, subject: []const u8) !u64 {
