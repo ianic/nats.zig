@@ -41,14 +41,16 @@ pub fn connect(allocator: Allocator, options: Options) !Conn {
 
 const Conn = struct {
     const Self = @This();
+    const Subscriptions = std.AutoHashMap(u16, Subscription);
 
     allocator: Allocator,
     net_cli: tcp.Client,
     scratch_buf: [default.max_control_line_size]u8 = undefined,
     read_buf: []u8,
-    sid: u64 = 0,
+    sid: u16 = 0,
     parser: Parser,
     options: Options,
+    subscriptions: Subscriptions,
 
     pub fn connect(allocator: Allocator, options: Options) !Self {
         const read_buf = try allocator.alloc(u8, options.read_buffer_size);
@@ -60,6 +62,7 @@ const Conn = struct {
             .read_buf = read_buf,
             .parser = Parser.init(read_buf[0..0]),
             .options = options,
+            .subscriptions = Subscriptions.init(allocator),
         };
         try conn.initNetCli();
         try conn.connectHandshake();
@@ -173,6 +176,7 @@ const Conn = struct {
             };
             self.net_cli = client;
             try self.initNetCli();
+            try self.reSubscribe();
             break;
         }
     }
@@ -228,14 +232,28 @@ const Conn = struct {
         debugConnOut(buf);
     }
 
-    pub fn subscribe(self: *Self, subject: []const u8) !u64 {
+    pub fn subscribe(self: *Self, subject: []const u8) !u16 {
         self.sid += 1;
-        try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "SUB {s} {d}\r\n", .{ subject, self.sid }));
-        return self.sid;
+        const sid = self.sid;
+        try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "SUB {s} {d}\r\n", .{ subject, sid }));
+        try self.subscriptions.put(sid, Subscription{
+            .sid = sid,
+            .subject = subject,
+        });
+        return sid;
     }
 
-    pub fn unsubscribe(self: *Self, sid: u64) !void {
+    fn reSubscribe(self: *Self) !void {
+        var iter = self.subscriptions.iterator();
+        while (iter.next()) |e| {
+            const s = e.value_ptr;
+            try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "SUB {s} {d}\r\n", .{ s.subject, s.sid }));
+        }
+    }
+
+    pub fn unsubscribe(self: *Self, sid: u16) !void {
         try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "UNSUB {d}\r\n", .{sid}));
+        _ = self.subscriptions.remove(sid);
     }
 
     pub fn publish(self: *Self, subject: []const u8, payload: []const u8) !void {
@@ -273,3 +291,8 @@ fn logProtocolOp(prefix: []const u8, buf: []const u8) void {
         log.debug("{s} {s}", .{ prefix, b });
     }
 }
+
+const Subscription = struct {
+    sid: u16,
+    subject: []const u8,
+};
