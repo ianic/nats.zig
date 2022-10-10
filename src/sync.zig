@@ -296,3 +296,48 @@ const Subscription = struct {
     sid: u16,
     subject: []const u8,
 };
+
+pub const Connect = struct {
+    verbose: bool = false,
+    pedantic: bool = false,
+    tls_required: bool = false,
+    headers: bool = false,
+    name: ?[]const u8 = null,
+    lang: ?[]const u8 = "zig",
+    version: ?[]const u8 = null,
+    protocol: ?u8 = null,
+    jwt: ?[]const u8 = null,
+    sig: ?[]const u8 = null,
+
+    const Self = @This();
+    fn stringify(self: Self, buf: []u8) ![]u8 {
+        var fba = std.heap.FixedBufferAllocator.init(buf);
+        var string = std.ArrayList(u8).init(fba.allocator());
+        try std.json.stringify(self, .{ .emit_null_optional_fields = false }, string.writer());
+        return buf[0..string.items.len];
+    }
+};
+
+test "Connect stringify" {
+    const c = Connect{
+        .verbose = true,
+    };
+    var buf: [4096]u8 = undefined;
+    var str = try c.stringify(&buf);
+
+    try std.testing.expectEqualStrings(
+        \\{"verbose":true,"pedantic":false,"tls_required":false,"headers":false,"lang":"zig"}
+    , str);
+
+    const c2 = Connect{
+        .verbose = true,
+        .jwt = "my_jwt_token",
+        .sig = "my_signature",
+    };
+    str = try c2.stringify(&buf);
+
+    //std.debug.print("buf: {s}", .{str});
+    try std.testing.expectEqualStrings(
+        \\{"verbose":true,"pedantic":false,"tls_required":false,"headers":false,"lang":"zig","jwt":"my_jwt_token","sig":"my_signature"}
+    , str);
+}
