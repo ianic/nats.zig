@@ -1,7 +1,6 @@
 const std = @import("std");
-const net = std.x.net;
-const tcp = net.tcp;
 const log = std.log.scoped(.nats);
+
 const Parser = @import("../src/NonAllocatingParser.zig");
 const Operation = Parser.Operation;
 const Msg = Parser.Msg;
@@ -44,7 +43,7 @@ const Conn = struct {
     const Subscriptions = std.AutoHashMap(u16, Subscription);
 
     allocator: Allocator,
-    net_cli: tcp.Client,
+    net: Net,
     scratch_buf: [default.max_control_line_size]u8 = undefined,
     read_buf: []u8,
     sid: u16 = 0,
@@ -58,7 +57,7 @@ const Conn = struct {
 
         var conn = Self{
             .allocator = allocator,
-            .net_cli = try tcpConnect(options.ip, options.port),
+            .net = try Net.init(options.ip, options.port),
             .read_buf = read_buf,
             .parser = Parser.init(read_buf[0..0]),
             .options = options,
@@ -70,7 +69,7 @@ const Conn = struct {
     }
 
     pub fn close(self: *Self) void {
-        self.net_cli.shutdown(.both) catch {};
+        self.net.close();
         self.allocator.free(self.read_buf);
     }
 
@@ -89,7 +88,7 @@ const Conn = struct {
 
     fn netRead(self: *Self) !?[]const u8 {
         const unparsed = self.parser.unparsedBytes();
-        const offset = self.net_cli.read(self.read_buf[unparsed..], 0) catch |err| {
+        const offset = self.net.read(self.read_buf[unparsed..]) catch |err| {
             if (err == error.WouldBlock) {
                 return null; // read timeout expired
             }
@@ -161,36 +160,13 @@ const Conn = struct {
     }
 
     fn reConnect(self: *Self) !void {
-        self.net_cli.shutdown(.both) catch {};
-        self.net_cli.deinit();
-        var cnt: usize = 0;
-        while (true) {
-            log.debug("reconnecting {d} of {d}", .{ cnt, self.options.max_reconnect });
-            var client = tcpConnect(self.options.ip, self.options.port) catch |err| {
-                if (cnt < self.options.max_reconnect) {
-                    std.time.sleep(self.options.reconnect_wait);
-                    cnt += 1;
-                    continue;
-                }
-                return err;
-            };
-            self.net_cli = client;
-            try self.initNetCli();
-            try self.reSubscribe();
-            break;
-        }
+        try self.net.reConnect(self.options.ip, self.options.port);
+        try self.initNetCli();
+        try self.reSubscribe();
     }
 
     fn initNetCli(self: *Self) !void {
-        try self.net_cli.setReadTimeout(self.options.read_timeout);
-    }
-
-    fn tcpConnect(ip: []const u8, port: u16) !tcp.Client {
-        const addr = net.ip.Address.initIPv4(try std.x.os.IPv4.parse(ip), port);
-        const client = try tcp.Client.init(.ip, .{ .close_on_exec = true });
-        try client.connect(addr);
-        errdefer client.deinit();
-        return client;
+        try self.net.setReadTimeout(self.options.read_timeout);
     }
 
     fn connectHandshake(self: *Self) !void {
@@ -218,7 +194,7 @@ const Conn = struct {
     }
 
     fn readOp(self: *Self) !Operation {
-        const offset = try self.net_cli.read(&self.scratch_buf, 0);
+        const offset = try self.net.read(&self.scratch_buf);
         debugConnIn(self.scratch_buf[0..offset]);
         var parser = Parser.init(self.scratch_buf[0..offset]);
 
@@ -228,7 +204,7 @@ const Conn = struct {
     }
 
     fn netWrite(self: *Self, buf: []const u8) !void {
-        _ = try self.net_cli.write(buf, 0);
+        _ = try self.net.write(buf);
         debugConnOut(buf);
     }
 
@@ -341,3 +317,59 @@ test "Connect stringify" {
         \\{"verbose":true,"pedantic":false,"tls_required":false,"headers":false,"lang":"zig","jwt":"my_jwt_token","sig":"my_signature"}
     , str);
 }
+
+const Net = struct {
+    client: std.x.net.tcp.Client,
+    max_reconnect: u8 = 16,
+    reconnect_wait: usize = std.time.ns_per_s * 2,
+
+    const Self = @This();
+    pub fn init(ip: []const u8, port: u16) !Self {
+        return .{
+            .client = try tcpConnect(ip, port),
+        };
+    }
+
+    fn tcpConnect(ip: []const u8, port: u16) !std.x.net.tcp.Client {
+        const addr = std.x.net.ip.Address.initIPv4(try std.x.os.IPv4.parse(ip), port);
+        const client = try std.x.net.tcp.Client.init(.ip, .{ .close_on_exec = true });
+        try client.connect(addr);
+        errdefer client.deinit();
+        return client;
+    }
+
+    pub fn setReadTimeout(self: *Self, read_timeout: u32) !void {
+        try self.client.setReadTimeout(read_timeout);
+    }
+
+    pub fn reConnect(self: *Self, ip: []const u8, port: u16) !void {
+        var cnt: usize = 0;
+        while (true) {
+            log.debug("reconnecting {d} of {d}", .{ cnt, self.max_reconnect });
+            var client = tcpConnect(ip, port) catch |err| {
+                if (cnt < self.max_reconnect) {
+                    std.time.sleep(self.reconnect_wait);
+                    cnt += 1;
+                    continue;
+                }
+                return err;
+            };
+            self.close();
+            self.client = client;
+            break;
+        }
+    }
+
+    pub fn close(self: *Self) void {
+        self.client.shutdown(.both) catch {};
+        self.client.deinit();
+    }
+
+    pub fn write(self: *Self, buf: []const u8) !usize {
+        return try self.client.write(buf, 0);
+    }
+
+    pub fn read(self: *Self, buf: []u8) !usize {
+        return try self.client.read(buf, 0);
+    }
+};
