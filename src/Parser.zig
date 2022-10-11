@@ -133,14 +133,14 @@ pub const Info = struct {
     client_id: u64 = 0,
     client_ip: []u8 = empty_str,
 
-    nonce: []u8 = empty_str,
+    nonce: ?[]u8 = null,
     cluster: []u8 = empty_str,
     connect_urls: [][]u8 = ([_][]u8{})[0..],
 
     ldm: bool = false,
     jetstream: bool = false,
 
-    fn jsonParse(alloc: Allocator, buf: []const u8) !Info {
+    pub fn jsonParse(alloc: Allocator, buf: []const u8) !Info {
         // fixing error: evaluation exceeded 1000 backwards branches
         // ref: https://github.com/ziglang/zig/issues/9728
         @setEvalBranchQuota(1024 * 8);

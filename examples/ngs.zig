@@ -8,13 +8,16 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var conn = try nats.connect(allocator, .{});
+    var conn = try nats.connect(allocator, .{
+        .host = "connect.ngs.global",
+        .creds_file_path = "/Users/ianic/mantil-io/infrastructure/secrets/logs-listener.creds",
+    });
     defer conn.close();
 
-    var sid = try conn.subscribe("foo");
+    var sid = try conn.subscribe("_INBOX.foo");
     std.log.debug("subscribe sid: {d}", .{sid});
     try conn.unsubscribe(sid);
-    sid = try conn.subscribe("foo");
+    sid = try conn.subscribe("_INBOX.foo");
     std.log.debug("subscribe sid: {d}", .{sid});
 
     while (true) {

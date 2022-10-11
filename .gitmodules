@@ -1,0 +1,3 @@
+[submodule "lib/zig-libressl"]
+	path = lib/zig-libressl
+	url = git@github.com:haze/zig-libressl.git
