@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.nats);
-const nkeys = @import("nkeys.zig");
+const Nkeys = @import("Nkeys.zig");
 
 const Parser = @import("../src/NonAllocatingParser.zig");
 const Operation = Parser.Operation;
@@ -10,7 +10,6 @@ const Allocator = std.mem.Allocator;
 const Info = @import("Parser.zig").Info;
 
 const operation = struct {
-    const connect = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"headers\":false,\"name\":\"\",\"lang\":\"zig\",\"version\":\"0.1.0\",\"protocol\":1}\r\n";
     const pong = "PONG\r\n";
     const ping = "PING\r\n";
 };
@@ -201,7 +200,7 @@ const Conn = struct {
         const info = self.info.?;
 
         var cnt = Connect{};
-        var nk = nkeys{};
+        var nk = Nkeys{};
 
         if (info.tls_required) {
             try self.net.wrapTLS();
@@ -223,6 +222,7 @@ const Conn = struct {
         _ = try self.netWrite(try cnt.operation(&self.scratch_buf));
         _ = try self.netWrite(operation.ping);
 
+        // TODO is this necessary, what if we get INFO before PONG
         // expect PONG
         if (try self.readOp() != .pong) {
             return Error.HandshakeFailed;
@@ -238,7 +238,7 @@ const Conn = struct {
 
     fn readOp(self: *Self) !Operation {
         const offset = try self.net.read(&self.scratch_buf);
-        if (offset == 0 ) {
+        if (offset == 0) {
             return Error.HandshakeFailed;
         }
         debugConnIn(self.scratch_buf[0..offset]);
@@ -250,7 +250,7 @@ const Conn = struct {
     }
 
     fn netWrite(self: *Self, buf: []const u8) !void {
-        _ = try self.net.write(buf);
+        try self.net.write(buf);
         debugConnOut(buf);
     }
 
@@ -340,11 +340,13 @@ pub const Connect = struct {
         return buf[0..string.items.len];
     }
 
+    // stringify into connect operation
+    // add CONNECT prefix and \r\n at end
     fn operation(self: Self, buf: []u8) ![]u8 {
         std.mem.copy(u8, buf, "CONNECT ");
         const offset = (try self.stringify(buf[8..])).len;
         std.mem.copy(u8, buf[8 + offset ..], "\r\n");
-        return buf[0..offset + 8 + 2];
+        return buf[0 .. offset + 8 + 2];
     }
 };
 
@@ -373,6 +375,9 @@ test "Connect stringify" {
 
 const libressl = @import("libressl");
 
+// abstraction over raw net socket connection
+// upgrade to tls
+// reconnect logic
 const Net = struct {
     const Options = struct {
         host: []const u8 = "localhost",
@@ -384,7 +389,13 @@ const Net = struct {
 
     allocator: Allocator,
     stream: std.net.Stream,
+    reader: std.net.Stream.Reader,
+    writer: std.net.Stream.Writer,
+
     ssl_stream: ?libressl.SslStream = null,
+    ssl_writer: ?libressl.SslStream.Writer = null,
+    ssl_reader: ?libressl.SslStream.Reader = null,
+
     options: Net.Options,
 
     const Self = @This();
@@ -394,6 +405,8 @@ const Net = struct {
         var self = Self{
             .allocator = allocator,
             .stream = stream,
+            .reader = stream.reader(),
+            .writer = stream.writer(),
             .options = options,
         };
         try self.setReadTimeout(options.read_timeout);
@@ -423,6 +436,8 @@ const Net = struct {
             };
             self.close();
             self.stream = stream;
+            self.reader = stream.reader();
+            self.writer = stream.writer();
             try self.setReadTimeout(opt.read_timeout);
             break;
         }
@@ -432,6 +447,8 @@ const Net = struct {
         if (self.ssl_stream != null) {
             self.ssl_stream.?.deinit();
             self.ssl_stream = null;
+            self.ssl_reader = null;
+            self.ssl_writer = null;
         } else {
             var tc = self.tcpClient();
             tc.shutdown(.both) catch {};
@@ -439,28 +456,25 @@ const Net = struct {
         }
     }
 
-    pub fn write(self: *Self, buf: []const u8) !usize {
-        // TODO fix this
-        if (self.ssl_stream) |ssl_stream| {
-            ssl_stream.writer().writeAll(buf) catch |err| {
-                return err;
-            };
-            return 0;
-            //return try ssl_stream.write(buf);
+    pub fn write(self: *Self, buf: []const u8) !void {
+        if (self.ssl_writer) |writer| {
+            return try writer.writeAll(buf);
         }
-        return try self.stream.write(buf);
+        return try self.writer.writeAll(buf);
     }
 
     pub fn read(self: *Self, buf: []u8) !usize {
-        if (self.ssl_stream) |ssl_stream| {
-            return try ssl_stream.reader().read(buf);
-            //return try ssl_stream.read(buf);
+        if (self.ssl_reader) |reader| {
+            return try reader.read(buf);
         }
-        return try self.stream.read(buf);
+        return try self.reader.read(buf);
     }
 
     pub fn wrapTLS(self: *Self) !void {
         var cfg = (libressl.TlsConfigurationParams{}).build() catch unreachable;
-        self.ssl_stream = try libressl.SslStream.wrapClientStream(cfg, self.stream, self.options.host);
+        var ss = try libressl.SslStream.wrapClientStream(cfg, self.stream, self.options.host);
+        self.ssl_reader = ss.reader();
+        self.ssl_writer = ss.writer();
+        self.ssl_stream = ss;
     }
 };

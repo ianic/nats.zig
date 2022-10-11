@@ -1,7 +1,5 @@
 const std = @import("std");
 const nats = @import("nats-sync");
-//const log = std.log.scoped(.app);
-//pub const log_level: std.log.Level = .info;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

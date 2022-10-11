@@ -87,7 +87,7 @@ pub fn wipe(self: *Self) void {
     }
 }
 
-fn init(creds_file_path: []const u8) !Self {
+pub fn init(creds_file_path: []const u8) !Self {
     var nk = Self{};
     try nk.readCredsFile(creds_file_path);
     return nk;
