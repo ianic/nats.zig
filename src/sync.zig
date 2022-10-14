@@ -181,7 +181,7 @@ const Conn = struct {
     }
 
     fn sendPong(self: *Self) !void {
-        _ = try self.netWrite(operation.pong);
+        try self.netWrite(operation.pong);
     }
 
     fn reConnect(self: *Self) !void {
@@ -219,8 +219,8 @@ const Conn = struct {
         }
 
         // send CONNECT, PING
-        _ = try self.netWrite(try cnt.operation(&self.scratch_buf));
-        _ = try self.netWrite(operation.ping);
+        try self.netWrite(try cnt.operation(&self.scratch_buf));
+        try self.netWrite(operation.ping);
 
         // TODO is this necessary, what if we get INFO before PONG
         // expect PONG
