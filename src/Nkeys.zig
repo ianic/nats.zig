@@ -2,93 +2,85 @@ const std = @import("std");
 const Ed25519 = std.crypto.sign.Ed25519;
 const base64 = std.base64.standard.Encoder;
 const base32 = @import("base32.zig").Decoder;
+const Allocator = std.mem.Allocator;
 
 const data_header_prefix = "-----BEGIN";
-line_buf: [data_header_prefix.len]u8 = undefined,
-
-jwt_buf: [4096]u8 = undefined,
-jwt: []const u8 = undefined,
-
-seed_buf: [64]u8 = undefined,
-seed_base32: []u8 = undefined,
-seed: [32]u8 = .{0} ** 32,
-
-sign_buf: [128]u8 = undefined,
-
 const Self = @This();
 
-pub fn readCredsFile(self: *Self, path: []const u8) !void {
+allocator: Allocator,
+jwt: []u8 = undefined,
+seed: []u8 = undefined,
+sign_buf: [128]u8 = undefined,
+
+fn readCredsFile(self: *Self, path: []const u8) !void {
     var file = try std.fs.openFileAbsolute(path, .{});
     defer file.close();
     var reader = file.reader();
+    var header_no: u8 = 0;
 
     while (true) {
-        // wait for line which is at least header_prefix len
-        const line = try self.readLinePrefix(reader);
-        if (line.len < data_header_prefix.len) {
-            continue;
-        }
-        try reader.skipUntilDelimiterOrEof('\n'); // consume to start of next line
-
-        if (std.mem.eql(u8, line, data_header_prefix)) { // if previous line was data header
-            if (self.jwt.len == 0) { // first data line is jwt
-                self.jwt = try reader.readUntilDelimiter(&self.jwt_buf, '\n');
-                //std.debug.print("jwt: {s}\n", .{self.jwt});
+        if (try lineHasPreffix(reader, data_header_prefix)) {
+            if (header_no == 0) { // first data line is jwt
+                self.jwt = try reader.readUntilDelimiterAlloc(self.allocator, '\n', 8192);
             } else { // second data line is seed
-                self.seed_base32 = try reader.readUntilDelimiter(&self.seed_buf, '\n');
-                try self.decodeSeed();
+                self.seed = try reader.readUntilDelimiterAlloc(self.allocator, '\n', 128);
                 return;
             }
+            header_no += 1;
         }
     }
 }
 
-// returns zero size buf if line is not at least len long
-// or first len bytes from line
-fn readLinePrefix(self: *Self, reader: std.fs.File.Reader) ![]u8 {
-    _ = reader.readUntilDelimiterOrEof(&self.line_buf, '\n') catch |err| {
+fn lineHasPreffix(reader: std.fs.File.Reader, comptime prefix: []const u8) !bool {
+    var buf: [prefix.len]u8 = undefined;
+    var ret = reader.readUntilDelimiterOrEof(&buf, '\n') catch |err| {
         switch (err) {
             error.StreamTooLong => {
-                return &self.line_buf;
+                //std.debug.print("buf: {s}\n", .{buf});
+                const match = std.mem.eql(u8, &buf, prefix);
+                try reader.skipUntilDelimiterOrEof('\n'); // consume to start of next line
+                return match;
             },
             else => {
                 return err;
             },
         }
     };
-    return self.line_buf[0..0];
+    if (ret == null) {
+        return error.EOF;
+    }
+    return false;
 }
 
-fn decodeSeed(self: *Self) !void {
-    var scratch: [64]u8 = undefined;
-    const buf = try base32.decode(&scratch, self.seed_base32); // base32 decode seed into buf
-    std.mem.copy(u8, &self.seed, buf[2..34]); // remove first two bytes (type) and checksum
+fn binarySeed(self: *Self) ![32]u8 {
+    var buf: [64]u8 = undefined;
+    _ = try base32.decode(&buf, self.seed); // base32 decode seed into buf
+    return buf[2..34].*; // remove first two bytes (type) and checksum
 }
 
 pub fn sign(self: *Self, nonce: []const u8) ![]const u8 {
-    //std.debug.print("jwt1 {d}\n", .{self.jwt});
-    var ss: [32]u8 = undefined;
-    std.mem.copy(u8, &ss, &self.seed);
-    const kp = try Ed25519.KeyPair.create(ss);
-    //std.debug.print("jwt2 {d}\n", .{self.jwt});
+    const kp = try Ed25519.KeyPair.create(try self.binarySeed());
     const signature = try Ed25519.sign(nonce, kp, null); // sign nonce with key pair
-    //std.debug.print("jwt3 {d}\n", .{self.jwt});
     return base64.encode(&self.sign_buf, &signature); // base64 encode signature into buf
 }
 
-pub fn wipe(self: *Self) void {
+fn wipe(self: *Self) void {
     var i: usize = 0;
-    while (i < self.seed_base32.len) : (i += 1) {
-        self.seed_base32[i] = 'x'; //0xa;
-    }
-    i = 0;
     while (i < self.seed.len) : (i += 1) {
-        self.seed[i] = 'x';
+        self.seed[i] = 'x'; //0xa;
     }
 }
 
-pub fn init(creds_file_path: []const u8) !Self {
-    var nk = Self{};
+pub fn deinit(self: *Self) void {
+    self.wipe();
+    self.allocator.free(self.jwt);
+    self.allocator.free(self.seed);
+}
+
+pub fn init(allocator: Allocator, creds_file_path: []const u8) !Self {
+    var nk = Self{
+        .allocator = allocator,
+    };
     try nk.readCredsFile(creds_file_path);
     return nk;
 }
@@ -99,21 +91,19 @@ test "readCredsFile" {
     const test_seed = "SUAOTBNEUHZDFJT3EUMELT7MQTP24JF3XVCXQNDSCU74G5IU6VAJBKH5LI";
     const test_jwt = "eyJ0eXAiOiJqd3QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.eyJqdGkiOiJHVDROVU5NRUY3Wk1XQ1JCWFZWVURLUVQ2WllQWjc3VzRKUlFYRDNMMjRIS1VKRUNRSDdRIiwiaWF0IjoxNTkwNzgxNTkzLCJpc3MiOiJBQURXTFRISUNWNFNVQUdGNkVLTlZFVzVCQlA3WVJESUJHV0dHSFo1SkJET1FZQTdHVUZNNkFRVSIsIm5hbWUiOiJPUEVSQVRPUiIsInN1YiI6IlVERTZXVEdMVFRQQ1JKUkpDS0JKUkdWTlpUTElWUjdMRUVFTFI0Q1lXV1dCS0pTN1hZSUtYRFVVIiwibmF0cyI6eyJwdWIiOnt9LCJzdWIiOnt9LCJ0eXBlIjoidXNlciIsInZlcnNpb24iOjJ9fQ.c_XQT04wEoVVNDRjPHeKwe17BOrSpQTcftwIbB7KoNEIz6peZCJDc4-J3emVepHofUOWy7IAo9TlLwYhuGHWAQ";
 
-    var nk = Self{};
+    var nk = Self{
+        .allocator = std.testing.allocator,
+    };
+    defer nk.deinit();
     try nk.readCredsFile(test_creds_file);
-    //try nk.decodeSeed();
 
-    //var nk = try init(test_creds_file);
-    const sig = try nk.sign("pero");
-    _ = sig;
-
-    try std.testing.expectEqualStrings(nk.seed_base32, test_seed);
+    try std.testing.expectEqualStrings(nk.seed, test_seed);
     try std.testing.expectEqualStrings(nk.jwt, test_jwt);
 }
 
 test "sign" {
-    var nk = Self{};
-    try nk.readCredsFile(test_creds_file);
+    var nk = try init(std.testing.allocator, test_creds_file);
+    defer nk.deinit();
 
     try std.testing.expectEqualStrings(
         try nk.sign("iso medo u ducan"),
@@ -126,13 +116,16 @@ test "sign" {
 }
 
 test "pero" {
-    // var nk = Self{};
-    // try nk.readCredsFile(test_creds_file);
-    var nk = try init(test_creds_file);
-    defer nk.wipe();
+    var nk = try init(std.testing.allocator, test_creds_file);
+    defer nk.deinit();
     const sig = try nk.sign("pero");
-    std.debug.print("sig: {s}\n", .{sig});
-    std.debug.print("ovaj je bitan jwt: \n{s}\n", .{nk.jwt});
+    _ = sig;
+}
+
+test "invalid file" {
+    const invalid_file = comptime root() ++ "NKeys.zig";
+    var err = init(std.testing.allocator, invalid_file);
+    try std.testing.expectError(error.EOF, err);
 }
 
 fn root() []const u8 {

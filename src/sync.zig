@@ -199,27 +199,29 @@ const Conn = struct {
         try self.onInfo(op.info);
         const info = self.info.?;
 
-        var cnt = Connect{};
-        var nk = Nkeys{};
+        // var cnt = Connect{};
+        // var nk = Nkeys{};
 
         if (info.tls_required) {
             try self.net.wrapTLS();
-            cnt.tls_required = true;
-
-            if (info.nonce) |nonce| {
-                if (self.options.creds_file_path) |fp| {
-                    try nk.readCredsFile(fp);
-                    defer nk.wipe();
-                    cnt.sig = try nk.sign(nonce);
-                    cnt.jwt = nk.jwt;
-                } else {
-                    return Error.MissingCredsFile;
-                }
-            }
         }
+        //     cnt.tls_required = true;
 
-        // send CONNECT, PING
-        try self.netWrite(try cnt.operation(&self.scratch_buf));
+        //     if (info.nonce) |nonce| {
+        //         if (self.options.creds_file_path) |fp| {
+        //             try nk.readCredsFile(fp);
+        //             defer nk.wipe();
+        //             cnt.sig = try nk.sign(nonce);
+        //             cnt.jwt = nk.jwt;
+        //         } else {
+        //             return Error.MissingCredsFile;
+        //         }
+        //     }
+        // }
+
+        // // send CONNECT, PING
+        // try self.netWrite(try cnt.operation(&self.scratch_buf));
+        try self.netWrite(try self.connectOperation(info));
         try self.netWrite(operation.ping);
 
         // TODO is this necessary, what if we get INFO before PONG
@@ -227,6 +229,29 @@ const Conn = struct {
         if (try self.readOp() != .pong) {
             return Error.HandshakeFailed;
         }
+    }
+
+    fn connectOperation(self: *Self, info: Info) ![]const u8 {
+        var cnt = Connect{};
+        var nk: ?Nkeys = null;
+        defer if (nk != null) {
+            nk.?.deinit();
+        };
+
+        if (info.tls_required) {
+            cnt.tls_required = true;
+
+            if (info.nonce) |nonce| {
+                if (self.options.creds_file_path) |fp| {
+                    nk = try Nkeys.init(self.allocator, fp);
+                    cnt.sig = try nk.?.sign(nonce);
+                    cnt.jwt = nk.?.jwt;
+                } else {
+                    return Error.MissingCredsFile;
+                }
+            }
+        }
+        return try cnt.operation(&self.scratch_buf);
     }
 
     fn onInfo(self: *Self, info: Parser.Info) !void {
