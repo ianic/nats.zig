@@ -98,6 +98,8 @@ const Conn = struct {
         }
     }
 
+    // Reads next message from connection.
+    // Returns null if options.read_timeout expires while waiting for message.
     pub fn read(self: *Self) !?Msg {
         while (true) {
             if (try self.parseReadBuffer()) |msg| {
@@ -119,7 +121,7 @@ const Conn = struct {
             }
             return err;
         };
-        if (offset == 0) {
+        if (offset == 0) { // connection closed
             try self.reConnect();
         }
         const buf = self.read_buf[0 .. offset + unparsed];
@@ -148,6 +150,17 @@ const Conn = struct {
         }
     }
 
+    fn sendPong(self: *Self) !void {
+        try self.netWrite(operation.pong);
+    }
+
+    fn onInfo(self: *Self, info: Parser.Info) !void {
+        if (self.info) |i| {
+            i.deinit(self.allocator);
+        }
+        self.info = try Info.jsonParse(self.allocator, info.args);
+    }
+
     fn parseOperation(self: *Self) !?Operation {
         return self.parser.next() catch |err| {
             switch (err) {
@@ -161,8 +174,8 @@ const Conn = struct {
     }
 
     fn onParserSplitBuffer(self: *Self) !void {
-        const extend = self.parser.parsed_index < self.parser.source.len / 2 or
-            self.parser.stat.batch_operations < 4;
+        const extend = (self.parser.source.len > self.read_buf.len / 2) and (self.parser.parsed_index < self.parser.source.len / 2 or
+            self.parser.stat.batch_operations < 4);
 
         const unparsed = self.parser.unparsed();
         if (extend) {
@@ -180,10 +193,6 @@ const Conn = struct {
         }
     }
 
-    fn sendPong(self: *Self) !void {
-        try self.netWrite(operation.pong);
-    }
-
     fn reConnect(self: *Self) !void {
         try self.net.reConnect();
         try self.connectHandshake();
@@ -199,38 +208,22 @@ const Conn = struct {
         try self.onInfo(op.info);
         const info = self.info.?;
 
-        // var cnt = Connect{};
-        // var nk = Nkeys{};
-
         if (info.tls_required) {
             try self.net.wrapTLS();
         }
-        //     cnt.tls_required = true;
 
-        //     if (info.nonce) |nonce| {
-        //         if (self.options.creds_file_path) |fp| {
-        //             try nk.readCredsFile(fp);
-        //             defer nk.wipe();
-        //             cnt.sig = try nk.sign(nonce);
-        //             cnt.jwt = nk.jwt;
-        //         } else {
-        //             return Error.MissingCredsFile;
-        //         }
-        //     }
-        // }
-
-        // // send CONNECT, PING
-        // try self.netWrite(try cnt.operation(&self.scratch_buf));
+        // send CONNECT, PING
         try self.netWrite(try self.connectOperation(info));
         try self.netWrite(operation.ping);
 
-        // TODO is this necessary, what if we get INFO before PONG
-        // expect PONG
+        // expect PONG TODO is this necessary, what if we get INFO before POGN
         if (try self.readOp() != .pong) {
             return Error.HandshakeFailed;
         }
     }
 
+    // create connect operation
+    // use creds_file to make nonce signature if authentication is required
     fn connectOperation(self: *Self, info: Info) ![]const u8 {
         var cnt = Connect{};
         var nk: ?Nkeys = null;
@@ -238,9 +231,7 @@ const Conn = struct {
             nk.?.deinit();
         };
 
-        if (info.tls_required) {
-            cnt.tls_required = true;
-
+        if (info.auth_required) {
             if (info.nonce) |nonce| {
                 if (self.options.creds_file_path) |fp| {
                     nk = try Nkeys.init(self.allocator, fp);
@@ -254,13 +245,7 @@ const Conn = struct {
         return try cnt.operation(&self.scratch_buf);
     }
 
-    fn onInfo(self: *Self, info: Parser.Info) !void {
-        if (self.info) |i| {
-            i.deinit(self.allocator);
-        }
-        self.info = try Info.jsonParse(self.allocator, info.args);
-    }
-
+    // read and parse one operation, used in connection handshake
     fn readOp(self: *Self) !Operation {
         const offset = try self.net.read(&self.scratch_buf);
         if (offset == 0) {
@@ -383,7 +368,7 @@ test "Connect stringify" {
     var str = try c.stringify(&buf);
 
     try std.testing.expectEqualStrings(
-        \\{"verbose":true,"pedantic":false,"tls_required":false,"headers":false,"lang":"zig"}
+        \\{"verbose":true,"pedantic":false,"tls_required":false,"headers":false,"lang":"zig","protocol":1}
     , str);
 
     const c2 = Connect{
@@ -394,7 +379,7 @@ test "Connect stringify" {
     str = try c2.stringify(&buf);
 
     try std.testing.expectEqualStrings(
-        \\{"verbose":true,"pedantic":false,"tls_required":false,"headers":false,"lang":"zig","jwt":"my_jwt_token","sig":"my_signature"}
+        \\{"verbose":true,"pedantic":false,"tls_required":false,"headers":false,"lang":"zig","protocol":1,"jwt":"my_jwt_token","sig":"my_signature"}
     , str);
 }
 
@@ -419,7 +404,7 @@ const Net = struct {
 
     ssl_stream: ?libressl.SslStream = null,
     ssl_writer: ?libressl.SslStream.Writer = null,
-    ssl_reader: ?libressl.SslStream.Reader = null,
+    ssl_reader: ?SyncReader = null,
 
     options: Net.Options,
 
@@ -434,7 +419,7 @@ const Net = struct {
             .writer = stream.writer(),
             .options = options,
         };
-        try self.setReadTimeout(options.read_timeout);
+        try self.setReadTimeout();
         return self;
     }
 
@@ -442,8 +427,8 @@ const Net = struct {
         return std.x.net.tcp.Client{ .socket = std.x.os.Socket{ .fd = self.stream.handle } };
     }
 
-    fn setReadTimeout(self: *Self, read_timeout: u32) !void {
-        try self.tcpClient().setReadTimeout(read_timeout);
+    fn setReadTimeout(self: *Self) !void {
+        try self.tcpClient().setReadTimeout(self.options.read_timeout);
     }
 
     pub fn reConnect(self: *Self) !void {
@@ -463,7 +448,7 @@ const Net = struct {
             self.stream = stream;
             self.reader = stream.reader();
             self.writer = stream.writer();
-            try self.setReadTimeout(opt.read_timeout);
+            try self.setReadTimeout();
             break;
         }
     }
@@ -498,8 +483,30 @@ const Net = struct {
     pub fn wrapTLS(self: *Self) !void {
         var cfg = (libressl.TlsConfigurationParams{}).build() catch unreachable;
         var ss = try libressl.SslStream.wrapClientStream(cfg, self.stream, self.options.host);
-        self.ssl_reader = ss.reader();
+        self.ssl_reader = syncReader(ss);
         self.ssl_writer = ss.writer();
         self.ssl_stream = ss;
+    }
+
+    // Extend ssl reader to return WouldBlock on read timeout.
+    // Reader from SslStream is ignoring read timeout (TLS_WANT_POLLIN):
+    //   https://github.com/haze/zig-libressl/blob/fe9c13da13ff5cdc22ea5c023ee6a16459bc89ab/src/SslStream.zig#L101
+    pub const SyncReadError = error{ ReadFailure, WouldBlock };
+
+    pub fn syncRead(self: libressl.SslStream, buffer: []u8) SyncReadError!usize {
+        var output = libressl.tls.tls_read(self.tls_context, buffer.ptr, buffer.len);
+        if (output == libressl.tls.TLS_WANT_POLLIN) {
+            return error.WouldBlock;
+        }
+        if (output < 0) {
+            return error.ReadFailure;
+        }
+        return @intCast(usize, output);
+    }
+
+    pub const SyncReader = std.io.Reader(libressl.SslStream, SyncReadError, syncRead);
+
+    pub fn syncReader(ssl: libressl.SslStream) SyncReader {
+        return SyncReader{ .context = ssl };
     }
 };

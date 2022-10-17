@@ -20,6 +20,8 @@ pub fn main() !void {
     while (true) {
         if (try conn.read()) |msg| {
             std.log.debug("got msg {d}", .{msg.payload.?.len});
+        } else {
+            std.log.debug("no message", .{});
         }
     }
 }
