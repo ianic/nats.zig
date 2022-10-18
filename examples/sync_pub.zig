@@ -23,5 +23,6 @@ pub fn main() !void {
         const buf = scratch[0..i];
         try conn.publish("foo", buf);
         log.info("{d}", .{buf.len});
+        //std.time.sleep(std.time.ns_per_s);
     }
 }
