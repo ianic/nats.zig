@@ -37,8 +37,24 @@ const Error = error{
 };
 
 pub fn connect(allocator: Allocator, options: Options) !Conn {
+    try ignoreSigPipe();
     return try Conn.connect(allocator, options);
 }
+
+fn ignoreSigPipe() !void {
+    // write to the closed socket raises signal (which closes app by default)
+    // instead of returning error
+    // by ignoring we got error on socket write
+    var act = std.os.Sigaction{
+        //.handler = .{ .handler = std.os.SIG.IGN },
+        .handler = .{ .handler = signalHandler },
+        .mask = std.os.empty_sigset,
+        .flags = 0,
+    };
+    try std.os.sigaction(std.os.SIG.PIPE, &act, null);
+}
+
+fn signalHandler(_: c_int) callconv(.C) void {}
 
 const Conn = struct {
     const Self = @This();
