@@ -289,7 +289,18 @@ const Conn = struct {
     }
 
     pub fn publish(self: *Self, subject: []const u8, payload: []const u8) !void {
-        try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "PUB {s} {d}\r\n", .{ subject, payload.len }));
+        self.publishMsg(subject, payload) catch |err| {
+            if (err != error.BrokenPipe) {
+                return err;
+            }
+            try self.reConnect();
+            try self.publishMsg(subject, payload);
+        };
+    }
+
+    fn publishMsg(self: *Self, subject: []const u8, payload: []const u8) !void {
+        const header = try std.fmt.bufPrint(&self.scratch_buf, "PUB {s} {d}\r\n", .{ subject, payload.len });
+        try self.netWrite(header);
         try self.netWrite(payload);
         try self.netWrite("\r\n");
     }
