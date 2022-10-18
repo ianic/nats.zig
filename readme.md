@@ -13,6 +13,30 @@ I started with the evented version but the switched to the threaded. Zig is curr
 Conn creates separate thread for reading from the TCP connection and parsing incoming bytes into operations. The rest is handled in the main thread. Those threads are connected by the [RingBuffer](src/RingBuffer.zig) in which parser writes operations and Conn reads from it. 
 -->
 
+Project depends on libressl for handling tls connections. Can be built using libressl from project or system. 
+
+To install libressl on macos:
+
+``` sh
+brew install libressl
+```
+and on linux: 
+
+``` sh
+wget https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-3.6.0.tar.gz
+tar -xf libressl-3.6.0.tar.gz
+ls -al
+cd libressl-3.6.0/
+./configure
+sudo make install
+```
+
+After that project can be build using system libressl:
+
+``` sh
+zig build -Duse-system-libressl 
+```
+
 ## Try
 
 Build project:
