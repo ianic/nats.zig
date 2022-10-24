@@ -46,6 +46,7 @@ fn ignoreSigPipe() !void {
     // instead of returning error
     // by ignoring we got error on socket write
     var act = std.os.Sigaction{
+        // TODO: change to this when https://github.com/ziglang/zig/issues/13216 is merged
         //.handler = .{ .handler = std.os.SIG.IGN },
         .handler = .{ .handler = signalHandler },
         .mask = std.os.empty_sigset,
