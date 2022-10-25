@@ -1,13 +1,14 @@
 const std = @import("std");
-const log = std.log.scoped(.nats);
-const Nkeys = @import("Nkeys.zig");
+const Allocator = std.mem.Allocator;
 
+const Nkeys = @import("Nkeys.zig");
 const Parser = @import("../src/NonAllocatingParser.zig");
 const Operation = Parser.Operation;
 const Msg = Parser.Msg;
 const Err = Parser.Err;
-const Allocator = std.mem.Allocator;
 const Info = @import("Parser.zig").Info;
+
+const log = std.log.scoped(.nats);
 
 const operation = struct {
     const pong = "PONG\r\n";
@@ -18,14 +19,16 @@ const default = struct {
     const max_control_line_size = 4096; // ref: https://github.com/nats-io/nats.go/blob/c75dfd54b52c9f37139ab592da3d4fcbec34eda2/parser.go#L28
 };
 
-const Options = struct {
-    read_buffer_size: u32 = 4096,
-    creds_file_path: ?[]const u8 = null,
-
-    // net options
+pub const Options = struct {
     host: []const u8 = "localhost",
     port: u16 = 4222,
+
+    creds_file_path: ?[]const u8 = null,
+
+    read_buffer_size: u32 = 4096,
     read_timeout: u32 = 1000, // milliseconds
+
+    with_reconnect: bool = true,
     max_reconnect: u8 = 60,
     reconnect_wait: usize = std.time.ns_per_s * 2,
 };
@@ -34,6 +37,7 @@ const Error = error{
     HandshakeFailed,
     ServerError,
     MissingCredsFile,
+    BrokenPipe,
 };
 
 pub fn connect(allocator: Allocator, options: Options) !Conn {
@@ -41,7 +45,7 @@ pub fn connect(allocator: Allocator, options: Options) !Conn {
     return try Conn.connect(allocator, options);
 }
 
-fn ignoreSigPipe() !void {
+pub fn ignoreSigPipe() !void {
     // write to the closed socket raises signal (which closes app by default)
     // instead of returning error
     // by ignoring we got error on socket write
@@ -57,7 +61,7 @@ fn ignoreSigPipe() !void {
 
 fn signalHandler(_: c_int) callconv(.C) void {}
 
-const Conn = struct {
+pub const Conn = struct {
     const Self = @This();
     const Subscriptions = std.AutoHashMap(u16, Subscription);
 
@@ -139,7 +143,11 @@ const Conn = struct {
             return err;
         };
         if (offset == 0) { // connection closed
-            try self.reConnect();
+            if (self.options.with_reconnect) {
+                try self.reConnect();
+            } else {
+                return Error.BrokenPipe;
+            }
         }
         const buf = self.read_buf[0 .. offset + unparsed];
         debugConnIn(buf);
@@ -306,16 +314,23 @@ const Conn = struct {
     }
 
     pub fn publish(self: *Self, subject: []const u8, payload: []const u8) !void {
-        self.publishMsg(subject, payload) catch |err| {
+        if (self.options.with_reconnect) {
+            return self.publishWithReconnect(subject, payload);
+        }
+        return self.publishRaw(subject, payload);
+    }
+
+    fn publishWithReconnect(self: *Self, subject: []const u8, payload: []const u8) !void {
+        self.publishRaw(subject, payload) catch |err| {
             if (err != error.BrokenPipe) {
                 return err;
             }
             try self.reConnect();
-            try self.publishMsg(subject, payload);
+            try self.publishRaw(subject, payload);
         };
     }
 
-    fn publishMsg(self: *Self, subject: []const u8, payload: []const u8) !void {
+    fn publishRaw(self: *Self, subject: []const u8, payload: []const u8) !void {
         const header = try std.fmt.bufPrint(&self.scratch_buf, "PUB {s} {d}\r\n", .{ subject, payload.len });
         try self.netWrite(header);
         try self.netWrite(payload);
