@@ -10,18 +10,15 @@ const Thread = std.Thread;
 // then locks provided mutex.
 pub fn RingBuffer(comptime T: type, comptime buffer_size: usize) type {
     return struct {
+        const Self = @This();
+
         buffer: [buffer_size]T = undefined,
         mut: Thread.Mutex = Thread.Mutex{},
         reader_cw: Thread.Condition = Thread.Condition{},
         writer_cw: Thread.Condition = Thread.Condition{},
         reader_pos: u64 = 0,
         writer_pos: u64 = 0,
-        state: State = .open,
-        const Self = @This();
-        const State = enum {
-            open,
-            closed,
-        };
+        closed: bool = false,
 
         // Use it in loop:
         // while (rb.get()) |val| {...}
@@ -30,7 +27,7 @@ pub fn RingBuffer(comptime T: type, comptime buffer_size: usize) type {
             while (true) {
                 self.mut.lock();
                 if (self.empty()) {
-                    if (self.state == .closed) { // returns null when closed
+                    if (self.closed) { // returns null when closed
                         self.mut.unlock();
                         return null;
                     }
@@ -59,7 +56,7 @@ pub fn RingBuffer(comptime T: type, comptime buffer_size: usize) type {
         // Will block when RB is full, and panic if put is make after close.
         pub fn put(self: *Self, data: T) void {
             self.mut.lock();
-            if (self.state == .closed) { // panics when closed
+            if (self.closed) { // panics when closed
                 self.mut.unlock();
                 unreachable;
             }
@@ -79,7 +76,7 @@ pub fn RingBuffer(comptime T: type, comptime buffer_size: usize) type {
         // Signal close. You should not write to the RB after close.
         pub fn close(self: *Self) void {
             self.mut.lock();
-            self.state = .closed;
+            self.closed = true;
             self.reader_cw.signal();
             self.mut.unlock();
         }
