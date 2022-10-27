@@ -13,10 +13,24 @@ pub const pkgs = struct {
         .source = .{ .path = "src/conn.zig" },
     };
 
+    // pub const RingBuffer = Pkg{
+    //     .name = "RingBuffer",
+    //     .source = .{.path = "src/RingBuffer.zig"},
+    // };
+
     pub const nats_sync = Pkg{
         .name = "nats-sync",
         .source = .{ .path = "src/sync.zig" },
         .dependencies = &[_]Pkg{
+            libressl,
+        },
+    };
+
+    pub const nats_threaded = Pkg{
+        .name = "nats-threaded",
+        .source = .{ .path = "src/threaded.zig" },
+        .dependencies = &[_]Pkg{
+            nats_sync,
             libressl,
         },
     };
@@ -74,5 +88,23 @@ pub fn build(b: *std.build.Builder) !void {
         example.setTarget(target);
         example.install();
         example_step.dependOn(&example.step);
+    }
+
+    const threaded_step = b.step("threaded", "Build examples");
+    inline for (.{
+        "threaded_sub",
+    }) |example_name| {
+        const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
+        //example.addPackage(pkgs.nats);
+        example.addPackage(pkgs.nats_threaded);
+        //,example.addPackage(pkgs.RingBuffer);
+        try zig_libressl.useLibreSslForStep(b, target, mode, "lib/zig-libressl/libressl", example, use_system_libressl);
+        example.addPackage(pkgs.libressl);
+        example.addIncludePath("/opt/homebrew/opt/libressl/include");
+        example.addLibraryPath("/opt/homebrew/opt/libressl/lib");
+        example.setBuildMode(mode);
+        example.setTarget(target);
+        example.install();
+        threaded_step.dependOn(&example.step);
     }
 }
