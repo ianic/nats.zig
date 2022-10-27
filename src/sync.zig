@@ -144,7 +144,7 @@ pub const Conn = struct {
         };
         if (offset == 0) { // connection closed
             if (self.options.with_reconnect) {
-                try self.reConnect();
+                try self.reconnect();
             } else {
                 return Error.BrokenPipe;
             }
@@ -218,8 +218,8 @@ pub const Conn = struct {
         }
     }
 
-    fn reConnect(self: *Self) !void {
-        try self.net.reConnect();
+    pub fn reconnect(self: *Self) !void {
+        try self.net.reconnect();
         try self.connectHandshake();
         try self.reSubscribe();
     }
@@ -325,7 +325,7 @@ pub const Conn = struct {
             if (err != error.BrokenPipe) {
                 return err;
             }
-            try self.reConnect();
+            try self.reconnect();
             try self.publishRaw(subject, payload);
         };
     }
@@ -474,7 +474,8 @@ const Net = struct {
         try self.tcpClient().setReadTimeout(self.options.read_timeout);
     }
 
-    pub fn reConnect(self: *Self) !void {
+    pub fn reconnect(self: *Self) !void {
+        self.shutdown();
         const opt = self.options;
         var cnt: usize = 0;
         while (true) {
@@ -507,6 +508,11 @@ const Net = struct {
             tc.shutdown(.both) catch {};
             tc.deinit();
         }
+    }
+
+    pub fn shutdown(self: *Self) void {
+        var tc = self.tcpClient();
+        tc.shutdown(.both) catch {};
     }
 
     pub fn write(self: *Self, buf: []const u8) !void {
