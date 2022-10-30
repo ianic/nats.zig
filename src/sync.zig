@@ -38,6 +38,7 @@ const Error = error{
     ServerError,
     MissingCredsFile,
     BrokenPipe,
+    NotSubscribed,
 };
 
 pub fn connect(allocator: Allocator, options: Options) !Conn {
@@ -308,9 +309,20 @@ pub const Conn = struct {
         }
     }
 
-    pub fn unsubscribe(self: *Self, sid: u16) !void {
+    pub fn unsubscribeBySid(self: *Self, sid: u16) !void {
         try self.netWrite(try std.fmt.bufPrint(&self.scratch_buf, "UNSUB {d}\r\n", .{sid}));
         _ = self.subscriptions.remove(sid);
+    }
+
+    pub fn unsubscribe(self: *Self, subject: []const u8) !void {
+        var iter = self.subscriptions.iterator();
+        while (iter.next()) |e| {
+            const s = e.value_ptr;
+            if (std.mem.eql(u8, subject, s.subject)) {
+                try self.unsubscribeBySid(s.sid);
+            }
+        }
+        return Error.NotSubscribed;
     }
 
     pub fn publish(self: *Self, subject: []const u8, payload: []const u8) !void {
