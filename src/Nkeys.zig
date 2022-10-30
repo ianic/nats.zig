@@ -60,8 +60,8 @@ fn binarySeed(self: *Self) ![32]u8 {
 
 pub fn sign(self: *Self, nonce: []const u8) ![]const u8 {
     const kp = try Ed25519.KeyPair.create(try self.binarySeed());
-    const signature = try Ed25519.sign(nonce, kp, null); // sign nonce with key pair
-    return base64.encode(&self.sign_buf, &signature); // base64 encode signature into buf
+    const signature = try kp.sign(nonce, null);
+    return base64.encode(&self.sign_buf, &signature.toBytes()); // base64 encode signature into buf
 }
 
 fn wipe(self: *Self) void {
