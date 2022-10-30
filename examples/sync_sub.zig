@@ -13,7 +13,7 @@ pub fn main() !void {
 
     var sid = try conn.subscribe("foo");
     std.log.debug("subscribe sid: {d}", .{sid});
-    try conn.unsubscribe(sid);
+    try conn.unsubscribeBySid(sid);
     sid = try conn.subscribe("foo");
     std.log.debug("subscribe sid: {d}", .{sid});
 
