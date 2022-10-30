@@ -5,7 +5,8 @@ const Parser = @import("../src/NonAllocatingParser.zig");
 pub const Msg = Parser.Msg;
 
 const sync = @import("sync.zig");
-const RingBuffer = @import("RingBuffer.zig").RingBuffer;
+//const RingBuffer = @import("RingBuffer.zig").RingBuffer;
+const Mpsc = @import("channel.zig").Mpsc;
 
 const log = std.log.scoped(.nats);
 
@@ -29,6 +30,7 @@ pub fn connect(allocator: Allocator, options: Options) !*Conn {
         }),
     };
     try conn.startLoops();
+    try setSignalHandler(conn);
     return conn;
 }
 
@@ -77,8 +79,8 @@ pub const PublishCommand = struct {
     payload: []const u8,
 };
 
-const EventChannel = RingBuffer(Event, 1024);
-const CommandChannel = RingBuffer(Command, 1024);
+const EventChannel = Mpsc(Event, 1024);
+const CommandChannel = Mpsc(Command, 1024);
 
 pub const Conn = struct {
     const Self = @This();
@@ -91,15 +93,21 @@ pub const Conn = struct {
     event_chan: EventChannel = .{},
     command_chan: CommandChannel = .{},
     status: Status = .connected,
+    unprocessed_cmd: ?Command = null,
+    reader_trd: ?std.Thread = null,
+    writer_trd: ?std.Thread = null,
 
     fn startLoops(self: *Self) !void {
         self.mut.lock();
         defer self.mut.unlock();
-
-        var reader_trd = try std.Thread.spawn(.{}, Self.readLoop, .{ self, self.connection_no });
-        reader_trd.detach();
-        var writer_trd = try std.Thread.spawn(.{}, Self.writeLoop, .{ self, self.connection_no });
-        writer_trd.detach();
+        if (self.reader_trd) |t| {
+            t.join();
+        }
+        self.reader_trd = try std.Thread.spawn(.{}, Self.readLoop, .{ self, self.connection_no });
+        if (self.writer_trd) |t| {
+            t.join();
+        }
+        self.writer_trd = try std.Thread.spawn(.{}, Self.writeLoop, .{ self, self.connection_no });
         self.setStatus(.connected);
     }
 
@@ -118,21 +126,22 @@ pub const Conn = struct {
         while (true) {
             if (try self.conn.read()) |msg| {
                 // TODO make copy of the msg payload
-                self.event_chan.put(Event{ .msg = msg });
+                self.event_chan.send(Event{ .msg = msg });
             }
             // TODO use read timeout
         }
     }
 
     fn reconnect_(self: *Self) void {
-        std.log.info("{d} starting connect", .{self.connection_no});
-
-        self.conn.reconnect() catch {
+        std.log.info("{d} starting reconnect", .{self.connection_no});
+        self.conn.reconnect() catch |err| {
+            std.log.info("{d} reconnect error {}", .{ self.connection_no, err });
             self.close_(.disconnected);
             return;
         };
-        self.startLoops() catch {
-            // TODO;
+        self.startLoops() catch |err| {
+            std.log.info("{d} start loops error {}", .{ self.connection_no, err });
+            self.close_(.disconnected);
             return;
         };
     }
@@ -151,7 +160,7 @@ pub const Conn = struct {
 
     fn setStatus(self: *Self, status: Status) void {
         self.status = status;
-        self.event_chan.put(Event{ .status_changed = .{ .status = status, .connection_no = self.connection_no } });
+        self.event_chan.send(Event{ .status_changed = .{ .status = status, .connection_no = self.connection_no } });
     }
 
     fn writeLoop(self: *Self, connection_no: u16) void {
@@ -166,32 +175,42 @@ pub const Conn = struct {
     }
 
     fn exitWriteLoop(self: *Self, connection_no: u16) void {
-        self.command_chan.put(Command{ .exit = connection_no });
+        _ = self.command_chan.trySend(Command{ .exit = connection_no });
     }
 
     fn writeLoop_(self: *Self, connection_no: u16) !void {
-        while (self.command_chan.get()) |cmd| {
-            switch (cmd) {
-                .sub => |subject| {
-                    _ = try self.conn.subscribe(subject);
-                },
-                .unsub => |_| {
-                    //try self.conn.unsubscribe(subject),
-                    // TODO add implementation
-                    //self.conn.unsubscribe()
-                },
-                .publish => |c| {
-                    try self.conn.publish(c.subject, c.payload);
-                    // TODO publish ack
-                    //self.read_chan.put();
-                },
-                .close => self.close_(.closed),
-                .exit => |cn| {
-                    if (cn == connection_no) {
-                        return;
-                    }
-                },
-            }
+        if (self.unprocessed_cmd) |cmd| {
+            try self.processCmd(connection_no, cmd);
+            self.unprocessed_cmd = null;
+        }
+
+        while (self.command_chan.recv()) |cmd| {
+            self.processCmd(connection_no, cmd) catch |err| {
+                self.unprocessed_cmd = cmd;
+                return err;
+            };
+        }
+    }
+
+    fn processCmd(self: *Self, connection_no: u16, cmd: Command) !void {
+        switch (cmd) {
+            .sub => |subject| {
+                _ = try self.conn.subscribe(subject);
+            },
+            .unsub => |subject| {
+                try self.conn.unsubscribe(subject);
+            },
+            .publish => |c| {
+                try self.conn.publish(c.subject, c.payload);
+                // TODO publish ack
+                //self.read_chan.put();
+            },
+            .close => self.close_(.closed),
+            .exit => |cn| {
+                if (cn == connection_no) {
+                    return;
+                }
+            },
         }
     }
 
@@ -205,31 +224,65 @@ pub const Conn = struct {
     }
 
     pub fn close(self: *Self) void {
-        self.command_chan.put(Command.close);
+        self.command_chan.send(Command.close);
         self.command_chan.close();
     }
 
     pub fn subscribe(self: *Self, subject: []const u8) void {
-        self.command_chan.put(Command{ .sub = subject });
+        self.command_chan.send(Command{ .sub = subject });
     }
 
     pub fn unsubscribe(self: *Self, subject: []const u8) void {
-        self.command_chan.put(Command{ .unsub = subject });
+        self.command_chan.send(Command{ .unsub = subject });
     }
 
     pub fn publish(self: *Self, subject: []const u8, payload: []const u8) void {
         // TODO: need to copy payload
-        self.command_chan.put(Command{ .publish = .{ .subject = subject, .payload = payload } });
+        self.command_chan.send(Command{ .publish = .{ .subject = subject, .payload = payload } });
     }
 
-    pub fn in(self: *Self) ?Event {
-        return self.event_chan.get();
+    pub fn recv(self: *Self) ?Event {
+        return self.event_chan.recv();
+    }
+
+    fn signal(self: *Self, sig: c_int) void {
+        std.log.info("got signal {d}", .{sig});
+        if (sig == std.os.SIG.INT or sig == std.os.SIG.TERM) {
+            self.close();
+        }
     }
 
     pub fn deinit(self: *Self) void {
         std.log.info("{d} deinit", .{self.connection_no});
         self.conn.deinit();
+        if (self.reader_trd) |t| {
+            t.join();
+        }
+        if (self.writer_trd) |t| {
+            t.join();
+        }
         self.allocator.destroy(self);
-        // TODO should I join on the threads (they are detached right now)
     }
 };
+
+// TODO: how to to this without global var signal_target
+fn setSignalHandler(conn: *Conn) !void {
+    signal_target = conn;
+    var act = std.os.Sigaction{
+        .handler = .{ .handler = sigHandler },
+        .mask = std.os.empty_sigset,
+        .flags = 0,
+    };
+    try std.os.sigaction(std.os.SIG.INT, &act, null);
+    try std.os.sigaction(std.os.SIG.TERM, &act, null);
+    try std.os.sigaction(std.os.SIG.USR1, &act, null);
+    try std.os.sigaction(std.os.SIG.USR2, &act, null);
+}
+
+var signal_target: ?*Conn = null;
+
+fn sigHandler(sig: c_int) callconv(.C) void {
+    if (signal_target) |conn| {
+        conn.signal(sig);
+    }
+}
