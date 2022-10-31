@@ -286,7 +286,12 @@ pub const Conn = struct {
     }
 
     fn netWrite(self: *Self, buf: []const u8) !void {
-        try self.net.write(buf);
+        self.net.write(buf) catch |err| {
+            if (err != error.BrokenPipe) {
+                log.debug("netWrite error: {s}", .{err});
+            }
+            return Error.BrokenPipe;
+        };
         debugConnOut(buf);
     }
 
@@ -314,12 +319,13 @@ pub const Conn = struct {
         _ = self.subscriptions.remove(sid);
     }
 
-    pub fn unsubscribe(self: *Self, subject: []const u8) !void {
+    pub fn unsubscribe(self: *Self, subject: []const u8) !u16 {
         var iter = self.subscriptions.iterator();
         while (iter.next()) |e| {
             const s = e.value_ptr;
             if (std.mem.eql(u8, subject, s.subject)) {
                 try self.unsubscribeBySid(s.sid);
+                return s.sid;
             }
         }
         return Error.NotSubscribed;

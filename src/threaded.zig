@@ -5,7 +5,6 @@ const Parser = @import("../src/NonAllocatingParser.zig");
 pub const Msg = Parser.Msg;
 
 const sync = @import("sync.zig");
-//const RingBuffer = @import("RingBuffer.zig").RingBuffer;
 const Mpsc = @import("channel.zig").Mpsc;
 
 const log = std.log.scoped(.nats);
@@ -14,6 +13,7 @@ pub const Options = struct {
     host: []const u8 = "localhost",
     port: u16 = 4222,
     creds_file_path: ?[]const u8 = null,
+    trap_signals: bool = true,
 };
 
 pub fn connect(allocator: Allocator, options: Options) !*Conn {
@@ -29,8 +29,12 @@ pub fn connect(allocator: Allocator, options: Options) !*Conn {
             .with_reconnect = false,
         }),
     };
+    errdefer conn.deinit();
+
     try conn.startLoops();
-    try setSignalHandler(conn);
+    if (options.trap_signals) {
+        try setSignalHandler(conn);
+    }
     return conn;
 }
 
@@ -186,8 +190,12 @@ pub const Conn = struct {
 
         while (self.command_chan.recv()) |cmd| {
             self.processCmd(connection_no, cmd) catch |err| {
-                self.unprocessed_cmd = cmd;
-                return err;
+                if (err == error.BrokenPipe) {
+                    self.unprocessed_cmd = cmd;
+                    return err;
+                } else {
+                    log.warn("process cmd error: {}", .{err});
+                }
             };
         }
     }
@@ -198,7 +206,7 @@ pub const Conn = struct {
                 _ = try self.conn.subscribe(subject);
             },
             .unsub => |subject| {
-                try self.conn.unsubscribe(subject);
+                _ = try self.conn.unsubscribe(subject);
             },
             .publish => |c| {
                 try self.conn.publish(c.subject, c.payload);
