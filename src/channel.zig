@@ -14,8 +14,7 @@ pub fn Mpsc(comptime T: type, comptime buffer_size: usize) type {
 
         buffer: [buffer_size]T = undefined,
         mut: Thread.Mutex = Thread.Mutex{},
-        reader_cw: Thread.Condition = Thread.Condition{},
-        writer_cw: Thread.Condition = Thread.Condition{},
+        cw: Thread.Condition = Thread.Condition{},
         reader_pos: usize = 0,
         writer_pos: usize = 0,
         closed: bool = false,
@@ -61,18 +60,20 @@ pub fn Mpsc(comptime T: type, comptime buffer_size: usize) type {
                     }
                     if (timeout_ns > 0) {
                         errdefer self.mut.unlock();
-                        try self.reader_cw.timedWait(&self.mut, timeout_ns);
+                        try self.cw.timedWait(&self.mut, timeout_ns);
                     } else {
-                        self.reader_cw.wait(&self.mut); // block until writer puts something
+                        self.cw.wait(&self.mut); // block until writer puts something
                     }
-                    if (self.empty()) {
+                    if (self.empty()) { // handle spurious wakeup
                         self.mut.unlock();
                         continue;
                     }
                 }
+                if (self.full()) {
+                    self.cw.signal();
+                }
                 var val = self.buffer[self.reader_pos % buffer_size];
                 self.reader_pos += 1;
-                self.writer_cw.signal();
                 self.mut.unlock();
                 return val;
             }
@@ -102,6 +103,7 @@ pub fn Mpsc(comptime T: type, comptime buffer_size: usize) type {
             self.mut.lock();
             if (self.closed) { // panics when closed
                 self.mut.unlock();
+                // TODO mybe return broken pipe error
                 unreachable;
             }
             while (true) {
@@ -110,12 +112,14 @@ pub fn Mpsc(comptime T: type, comptime buffer_size: usize) type {
                         self.mut.unlock();
                         return false;
                     }
-                    self.writer_cw.wait(&self.mut); // block until reader advances
+                    self.cw.wait(&self.mut); // block until reader advances
                     continue;
+                }
+                if (self.empty()) {
+                    self.cw.signal();
                 }
                 self.buffer[self.writer_pos % buffer_size] = data;
                 self.writer_pos += 1;
-                self.reader_cw.signal();
                 self.mut.unlock();
                 return true;
             }
@@ -125,7 +129,7 @@ pub fn Mpsc(comptime T: type, comptime buffer_size: usize) type {
         pub fn close(self: *Self) void {
             self.mut.lock();
             self.closed = true;
-            self.reader_cw.signal();
+            self.cw.signal();
             self.mut.unlock();
         }
     };
