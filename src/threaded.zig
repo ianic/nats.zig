@@ -130,7 +130,7 @@ pub const Conn = struct {
         while (true) {
             if (try self.conn.read()) |msg| {
                 // TODO make copy of the msg payload
-                self.event_chan.send(Event{ .msg = msg });
+                try self.event_chan.send(Event{ .msg = msg });
             }
             // TODO use read timeout
         }
@@ -164,7 +164,7 @@ pub const Conn = struct {
 
     fn setStatus(self: *Self, status: Status) void {
         self.status = status;
-        self.event_chan.send(Event{ .status_changed = .{ .status = status, .connection_no = self.connection_no } });
+        self.event_chan.send(Event{ .status_changed = .{ .status = status, .connection_no = self.connection_no } }) catch {};
     }
 
     fn writeLoop(self: *Self, connection_no: u16) void {
@@ -179,7 +179,9 @@ pub const Conn = struct {
     }
 
     fn exitWriteLoop(self: *Self, connection_no: u16) void {
-        _ = self.command_chan.trySend(Command{ .exit = connection_no });
+        _ = self.command_chan.trySend(Command{ .exit = connection_no }) catch {
+            unreachable;
+        };
     }
 
     fn writeLoop_(self: *Self, connection_no: u16) !void {
@@ -232,21 +234,29 @@ pub const Conn = struct {
     }
 
     pub fn close(self: *Self) void {
-        self.command_chan.send(Command.close);
+        self.command_chan.send(Command.close) catch {
+            unreachable;
+        };
         self.command_chan.close();
     }
 
     pub fn subscribe(self: *Self, subject: []const u8) void {
-        self.command_chan.send(Command{ .sub = subject });
+        self.command_chan.send(Command{ .sub = subject }) catch {
+            unreachable;
+        };
     }
 
     pub fn unsubscribe(self: *Self, subject: []const u8) void {
-        self.command_chan.send(Command{ .unsub = subject });
+        self.command_chan.send(Command{ .unsub = subject }) catch {
+            unreachable;
+        };
     }
 
     pub fn publish(self: *Self, subject: []const u8, payload: []const u8) void {
         // TODO: need to copy payload
-        self.command_chan.send(Command{ .publish = .{ .subject = subject, .payload = payload } });
+        self.command_chan.send(Command{ .publish = .{ .subject = subject, .payload = payload } }) catch {
+            unreachable;
+        };
     }
 
     pub fn recv(self: *Self) ?Event {

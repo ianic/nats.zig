@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Nkeys = @import("Nkeys.zig");
-const Parser = @import("../src/NonAllocatingParser.zig");
+const Parser = @import("NonAllocatingParser.zig");
 const Operation = Parser.Operation;
 const Msg = Parser.Msg;
 const Err = Parser.Err;
@@ -288,7 +288,7 @@ pub const Conn = struct {
     fn netWrite(self: *Self, buf: []const u8) !void {
         self.net.write(buf) catch |err| {
             if (err != error.BrokenPipe) {
-                log.debug("netWrite error: {s}", .{err});
+                log.debug("netWrite error: {}", .{err});
             }
             return Error.BrokenPipe;
         };
