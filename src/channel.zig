@@ -89,22 +89,21 @@ pub fn Mpsc(comptime T: type, comptime buffer_size: usize) type {
 
         // Will block when chan is full.
         // Panics if send after close.
-        pub fn send(self: *Self, data: T) void {
-            _ = self.send_(data, true);
+        pub fn send(self: *Self, data: T) error{Closed}!void {
+            _ = try self.send_(data, true);
         }
 
         // Returns false if chan is full and data is not pushed to the chan.
-        pub fn trySend(self: *Self, data: T) bool {
-            return self.send_(data, false);
+        pub fn trySend(self: *Self, data: T) error{Closed}!bool {
+            return try self.send_(data, false);
         }
 
         // Returns false if send is non blocking and channel is full (can't send).
-        fn send_(self: *Self, data: T, blocking: bool) bool {
+        fn send_(self: *Self, data: T, blocking: bool) error{Closed}!bool {
             self.mut.lock();
             if (self.closed) { // panics when closed
                 self.mut.unlock();
-                // TODO mybe return broken pipe error
-                unreachable;
+                return error.Closed;
             }
             while (true) {
                 if (self.full()) {
@@ -128,9 +127,12 @@ pub fn Mpsc(comptime T: type, comptime buffer_size: usize) type {
         // Closes channel. You should not send to the chan after close.
         pub fn close(self: *Self) void {
             self.mut.lock();
+            defer self.mut.unlock();
+            if (self.closed) {
+                return;
+            }
             self.closed = true;
             self.cw.signal();
-            self.mut.unlock();
         }
     };
 }
@@ -143,11 +145,11 @@ const time = std.time;
 test "non blocking" {
     var ch = Mpsc(u8, 2){};
     try expectEqual(2, ch.buffer.len);
-    ch.send(@intCast(u8, 100));
+    try ch.send(@intCast(u8, 100));
     try expectEqual(@intCast(usize, 1), ch.writer_pos);
     try expectEqual(@intCast(usize, 0), ch.reader_pos);
 
-    ch.send(@intCast(u8, 101));
+    try ch.send(@intCast(u8, 101));
     try expectEqual(@intCast(usize, 2), ch.writer_pos);
     try expectEqual(@intCast(usize, 0), ch.reader_pos);
 
@@ -155,7 +157,7 @@ test "non blocking" {
     try expectEqual(@intCast(usize, 2), ch.writer_pos);
     try expectEqual(@intCast(usize, 1), ch.reader_pos);
 
-    ch.send(@intCast(u8, 102));
+    try ch.send(@intCast(u8, 102));
     try expectEqual(@intCast(usize, 3), ch.writer_pos);
     try expectEqual(@intCast(usize, 1), ch.reader_pos);
 
@@ -165,7 +167,7 @@ test "non blocking" {
 
     var i: usize = 2;
     while (i < 100) : (i += 1) {
-        ch.send(@intCast(u8, 100 + i + 1));
+        try ch.send(@intCast(u8, 100 + i + 1));
         try expectEqual(@intCast(usize, i + 2), ch.writer_pos);
         try expectEqual(@intCast(usize, i), ch.reader_pos);
 
@@ -181,11 +183,11 @@ test "non blocking" {
 
 test "try send" {
     var ch = Mpsc(u8, 2){};
-    try expect(ch.trySend(@intCast(u8, 100)));
-    try expect(ch.trySend(@intCast(u8, 101)));
-    try expect(!ch.trySend(@intCast(u8, 102))); // full trySend returns false
+    try expect(try ch.trySend(@intCast(u8, 100)));
+    try expect(try ch.trySend(@intCast(u8, 101)));
+    try expect(!try ch.trySend(@intCast(u8, 102))); // full trySend returns false
     try expectEqual(@intCast(u8, 100), ch.recv().?);
-    try expect(ch.trySend(@intCast(u8, 102)));
+    try expect(try ch.trySend(@intCast(u8, 102)));
 }
 
 test "recvTimeout results" {
@@ -193,12 +195,12 @@ test "recvTimeout results" {
     var ch = Channel{};
     try expectEqual(Channel.RecvResult.timeout, ch.recvTimeout(1));
 
-    try expect(ch.trySend(@intCast(u8, 100)));
+    try expect(try ch.trySend(@intCast(u8, 100)));
     const r = ch.recvTimeout(1);
     try expectEqual(Channel.RecvResult.data, r);
     try expectEqual(r.data, 100);
 
-    try expect(ch.trySend(@intCast(u8, 101)));
+    try expect(try ch.trySend(@intCast(u8, 101)));
     ch.close();
     try expectEqual(Channel.RecvResult.data, ch.recvTimeout(1));
     try expectEqual(Channel.RecvResult.closed, ch.recvTimeout(1));
@@ -216,7 +218,9 @@ const TestWriter = struct {
             if (self.sleep > 0) {
                 time.sleep(self.sleep * time.ns_per_ms);
             }
-            self.ch.send(i);
+            self.ch.send(i) catch {
+                unreachable;
+            };
         }
         self.ch.close();
     }
@@ -250,6 +254,7 @@ test "slow consumer" {
 
     Thread.join(writer_trd);
     Thread.join(reader_trd);
+    try expectEqual(reader.last_val, 99);
 }
 
 test "slow publisher" {
@@ -263,4 +268,5 @@ test "slow publisher" {
 
     Thread.join(writer_trd);
     Thread.join(reader_trd);
+    try expectEqual(reader.last_val, 99);
 }
