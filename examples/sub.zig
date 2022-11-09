@@ -1,7 +1,9 @@
 const std = @import("std");
 const nats = @import("nats-sync");
-//const log = std.log.scoped(.app);
-//pub const log_level: std.log.Level = .info;
+
+pub const scope_levels = [_]std.log.ScopeLevel{
+    .{ .scope = .nats, .level = .info }, // set to debug to view nats lib logs
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -19,43 +21,7 @@ pub fn main() !void {
 
     while (true) {
         if (try conn.read()) |msg| {
-            std.log.debug("got msg {d}", .{msg.payload.?.len});
-        } else {
-            std.log.debug("no message", .{});
+            std.log.debug("got msg with payload len {d}", .{msg.payload.?.len});
         }
     }
-}
-
-// what log level from libs are allowed
-const libsLogLevel = std.log.Level.debug;
-
-pub fn log(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.EnumLiteral),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    // Ignore all non-error logging from sources other than .default
-    const scope_prefix = switch (scope) {
-        .default => "",
-        else => if (@enumToInt(level) <= @enumToInt(libsLogLevel))
-            "(" ++ @tagName(scope) ++ ") "
-        else
-            return,
-    };
-
-    const prefix = comptime switch (level) {
-        .debug => "[DBG] ",
-        .info => "[INF] ",
-        .warn => "[WRN] ",
-        .err => "[ERR] ",
-    } ++ scope_prefix;
-
-    // Print the message to stderr, silently ignoring any errors
-    std.debug.getStderrMutex().lock();
-    defer std.debug.getStderrMutex().unlock();
-    const stderr = std.io.getStdErr().writer();
-
-    stderr.print("{d} ", .{std.time.milliTimestamp()}) catch return;
-    stderr.print(prefix ++ format ++ "\n", args) catch return;
 }

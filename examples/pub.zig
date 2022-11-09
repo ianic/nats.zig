@@ -1,7 +1,9 @@
 const std = @import("std");
 const nats = @import("nats-sync");
-const log = std.log.scoped(.app);
-pub const log_level: std.log.Level = .info;
+
+pub const scope_levels = [_]std.log.ScopeLevel{
+    .{ .scope = .nats, .level = .info }, // set to debug to view nats lib logs
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -19,10 +21,9 @@ pub fn main() !void {
 
     var i: usize = 1;
     while (i < 1024) : (i += 1) {
-        //const payload = try std.fmt.bufPrint(&scratch, "msg {d}", .{i});
         const buf = scratch[0..i];
         try conn.publish("foo", buf);
-        log.info("{d}", .{buf.len});
+        std.log.debug("{d}", .{buf.len});
         //std.time.sleep(std.time.ns_per_s);
     }
 }
