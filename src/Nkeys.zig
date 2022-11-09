@@ -115,13 +115,6 @@ test "sign" {
     );
 }
 
-test "pero" {
-    var nk = try init(std.testing.allocator, test_creds_file);
-    defer nk.deinit();
-    const sig = try nk.sign("pero");
-    _ = sig;
-}
-
 test "invalid file" {
     const invalid_file = comptime root() ++ "NKeys.zig";
     var err = init(std.testing.allocator, invalid_file);

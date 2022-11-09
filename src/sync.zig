@@ -5,8 +5,6 @@ const Nkeys = @import("Nkeys.zig");
 const Parser = @import("NonAllocatingParser.zig");
 const Operation = Parser.Operation;
 const Msg = Parser.Msg;
-const Err = Parser.Err;
-const Info = @import("Parser.zig").Info;
 
 const log = std.log.scoped(.nats);
 
@@ -577,3 +575,86 @@ const Net = struct {
         return SyncReader{ .context = ssl };
     }
 };
+
+test {
+    // Run tests in imported files in `zig build test`
+    _ = @import("NonAllocatingParser.zig");
+    _ = @import("Nkeys.zig");
+}
+
+pub const Info = struct {
+    // ref: https://docs.nats.io/reference/reference-protocols/nats-protocol#info
+    // https://github.com/nats-io/nats.go/blob/e076b0dcab3193b8d7cf41c1b747355ad1302170/nats.go#L687
+    server_id: ?[]u8 = null,
+    server_name: ?[]u8 = null,
+    proto: u32 = 1,
+    version: ?[]u8 = null,
+    host: ?[]u8 = null,
+    port: u32 = 4222,
+
+    headers: bool = false,
+    auth_required: bool = false,
+    tls_required: bool = false,
+    tls_available: bool = false,
+
+    max_payload: u64 = 1048576,
+    client_id: u64 = 0,
+    client_ip: ?[]u8 = null,
+
+    nonce: ?[]u8 = null,
+    cluster: ?[]u8 = null,
+    connect_urls: [][]u8 = ([_][]u8{})[0..],
+
+    ldm: bool = false,
+    jetstream: bool = false,
+
+    pub fn jsonParse(alloc: Allocator, buf: []const u8) !Info {
+        // fixing error: evaluation exceeded 1000 backwards branches
+        // ref: https://github.com/ziglang/zig/issues/9728
+        @setEvalBranchQuota(1024 * 8);
+        var stream = std.json.TokenStream.init(buf);
+        var info = try std.json.parse(Info, &stream, .{
+            .allocator = alloc,
+            .ignore_unknown_fields = true,
+            //.allow_trailing_data = true,
+        });
+        return info;
+    }
+
+    pub fn deinit(self: Info, alloc: Allocator) void {
+        std.json.parseFree(Info, self, .{
+            .allocator = alloc,
+        });
+    }
+};
+
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const mem = std.mem;
+
+test "decode server info operation JSON args into Info struct" {
+    const test_info_op =
+        \\{"server_id":"id","server_name":"name","version":"2.8.0","proto":1,"go":"go1.18","host":"0.0.0.0","port":4222,"headers":true,"max_payload":123456,"jetstream":true,"client_id":53,"client_ip":"127.0.0.1","connect_urls":["10.0.0.184:4333","192.168.129.1:4333","192.168.192.1:4333"]}
+    ;
+
+    var alloc = std.testing.allocator;
+    var info = try Info.jsonParse(alloc, test_info_op);
+    defer info.deinit(alloc);
+
+    try expect(mem.eql(u8, "id", info.server_id.?));
+    try expect(mem.eql(u8, "name", info.server_name.?));
+    try expect(mem.eql(u8, "2.8.0", info.version.?));
+    try expect(mem.eql(u8, "127.0.0.1", info.client_ip.?));
+    try expect(info.nonce == null);
+    try expectEqual(info.port, 4222);
+    try expectEqual(info.proto, 1);
+    try expectEqual(info.max_payload, 123456);
+    try expectEqual(info.client_id, 53);
+    try expect(info.headers);
+    try expect(info.jetstream);
+
+    try expectEqual(info.connect_urls.len, 3);
+    try expect(mem.eql(u8, info.connect_urls[0], "10.0.0.184:4333"));
+    try expect(mem.eql(u8, info.connect_urls[1], "192.168.129.1:4333"));
+    try expect(mem.eql(u8, info.connect_urls[2], "192.168.192.1:4333"));
+}

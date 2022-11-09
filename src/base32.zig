@@ -1,3 +1,6 @@
+// This file is unmodified copy of:
+// https://github.com/rutgerbrf/zig-nkeys/blob/master/src/base32.zig
+//
 const std = @import("std");
 const testing = std.testing;
 
