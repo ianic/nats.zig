@@ -1,5 +1,5 @@
 const std = @import("std");
-const nats = @import("nats-sync");
+const nats = @import("nats");
 
 pub const scope_levels = [_]std.log.ScopeLevel{
     .{ .scope = .nats, .level = .info }, // set to debug to view nats lib logs

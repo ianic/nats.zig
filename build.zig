@@ -8,9 +8,9 @@ pub const pkgs = struct {
         .source = std.build.FileSource.relative("lib/zig-libressl/src/main.zig"),
     };
 
-    pub const nats_sync = Pkg{
-        .name = "nats-sync",
-        .source = .{ .path = "src/sync.zig" },
+    pub const nats = Pkg{
+        .name = "nats",
+        .source = .{ .path = "src/main.zig" },
         .dependencies = &[_]Pkg{
             libressl,
         },
@@ -25,11 +25,11 @@ pub fn build(b: *std.build.Builder) !void {
     const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
 
-    const lib = b.addStaticLibrary("nats-sync", "./src/sync.zig");
+    const lib = b.addStaticLibrary("nats", "./src/main.zig");
     lib.setBuildMode(mode);
     lib.install();
 
-    const main_tests = b.addTest("src/sync.zig");
+    const main_tests = b.addTest("src/main.zig");
     main_tests.setBuildMode(mode);
 
     const test_step = b.step("test", "Run library tests");
@@ -43,7 +43,7 @@ pub fn build(b: *std.build.Builder) !void {
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
         //example.addPackage(pkgs.nats);
-        example.addPackage(pkgs.nats_sync);
+        example.addPackage(pkgs.nats);
         try zig_libressl.useLibreSslForStep(b, target, mode, "lib/zig-libressl/libressl", example, use_system_libressl);
         example.addPackage(pkgs.libressl);
         example.addIncludePath("/opt/homebrew/opt/libressl/include");
